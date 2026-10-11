@@ -19,11 +19,10 @@ unstaged binary patches, and only untracked files explicitly named with
 
 The first push records an internal handoff snapshot on the VM. `pull` exports only
 the changes made after that snapshot, so it does not echo the Mac's original
-dirty files back. `--apply` first verifies the same local Git base and a clean
-patch application; otherwise it refuses without changing the local workspace.
-This first version returns tracked-file changes (and edits to initially
-included untracked files); newly created remote untracked files are rejected
-for manual transfer rather than silently lost.
+dirty files back. Its binary Git patch includes tracked changes and newly created,
+non-ignored untracked files. `--apply` first verifies the same local Git base and
+a clean patch application; otherwise it refuses without changing the local
+workspace.
 
 The test target is not a mount. Relay copies an archive over SSH, matching the
 future cloud transport boundary.

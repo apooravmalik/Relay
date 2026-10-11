@@ -10,8 +10,9 @@ Usage:
   relay connect --project DIR [--vm NAME]
   relay pull --project DIR [--vm NAME] [--apply] > remote.patch
 
-Without --apply, pull writes the remote delta as a patch. --apply checks that
-the local Git base is unchanged and that the patch applies cleanly first.
+Without --apply, pull writes the remote delta as a patch. The delta includes
+non-ignored untracked files. --apply checks that the local Git base is
+unchanged and that the patch applies cleanly first.
 EOF
 }
 
@@ -231,14 +232,26 @@ command_pull() {
   remote_base=$(ssh_vm "$vm" "git -C \"\$HOME/$workspace\" rev-parse --verify refs/relay/synced^" 2>/dev/null) || die "remote handoff snapshot is missing; push the project again"
   local_base=$(git -C "$project" rev-parse HEAD)
   [[ "$local_base" == "$remote_base" ]] || die "local HEAD changed since push; inspect/export the patch before applying"
-  [[ -z "$(ssh_vm "$vm" "git -C \"\$HOME/$workspace\" ls-files --others --exclude-standard")" ]] || die "remote has new untracked files; export the patch and move those files manually"
+
+  remote_delta() {
+    ssh_vm "$vm" bash -s -- "$workspace" <<'REMOTE'
+set -euo pipefail
+workspace="$HOME/$1"
+temp=$(mktemp -d)
+trap 'rm -rf "$temp"' EXIT
+cp "$workspace/.git/index" "$temp/index"
+tree=$(GIT_INDEX_FILE="$temp/index" git -C "$workspace" add -A && GIT_INDEX_FILE="$temp/index" git -C "$workspace" write-tree)
+git -C "$workspace" diff --binary --full-index refs/relay/synced "$tree"
+REMOTE
+  }
+
   if [[ "$apply" == false ]]; then
-    ssh_vm "$vm" "git -C \"\$HOME/$workspace\" diff --binary --full-index refs/relay/synced"
+    remote_delta
     return
   fi
   patch=$(mktemp "${TMPDIR:-/tmp}/relay-pull.XXXXXX")
   trap 'rm -f "$patch"' RETURN
-  ssh_vm "$vm" "git -C \"\$HOME/$workspace\" diff --binary --full-index refs/relay/synced" > "$patch"
+  remote_delta > "$patch"
   git -C "$project" apply --check "$patch" || die "remote change conflicts with the local workspace; rerun pull without --apply to inspect it"
   git -C "$project" apply "$patch"
   ssh_vm "$vm" bash -s -- "$workspace" <<'REMOTE'
@@ -248,9 +261,7 @@ base=$(git -C "$workspace" rev-parse refs/relay/synced^)
 temp=$(mktemp -d)
 trap 'rm -rf "$temp"' EXIT
 cp "$workspace/.git/index" "$temp/index"
-git -C "$workspace" add -A
-tree=$(git -C "$workspace" write-tree)
-cp "$temp/index" "$workspace/.git/index"
+tree=$(GIT_INDEX_FILE="$temp/index" git -C "$workspace" add -A && GIT_INDEX_FILE="$temp/index" git -C "$workspace" write-tree)
 snapshot=$(GIT_AUTHOR_NAME=Relay GIT_AUTHOR_EMAIL=relay@localhost GIT_COMMITTER_NAME=Relay GIT_COMMITTER_EMAIL=relay@localhost git -C "$workspace" commit-tree "$tree" -p "$base" <<<'Relay handoff snapshot')
 git -C "$workspace" update-ref refs/relay/synced "$snapshot"
 REMOTE
