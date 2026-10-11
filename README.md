@@ -14,8 +14,8 @@ session. `--vm` accepts either a Lima VM name or a normal SSH host alias from
 ```
 
 `push` transfers a Git bundle for the base commit, separate staged and
-unstaged binary patches, and only untracked files explicitly named with
-`--include`. It restores remotely and verifies both Git patch hashes.
+unstaged binary patches, and every non-ignored untracked file. It restores
+remotely and verifies both Git patch hashes.
 
 The first push records an internal handoff snapshot on the VM. `pull` exports only
 the changes made after that snapshot, so it does not echo the Mac's original

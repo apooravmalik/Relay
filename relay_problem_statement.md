@@ -180,7 +180,7 @@ relay push
 Relay:
 
 1. identifies the base Git commit
-2. captures staged, unstaged, and selected untracked changes
+2. captures staged, unstaged, and non-ignored untracked changes
 3. identifies the environment definition
 4. captures selected persistent service data
 5. provisions or resumes remote compute

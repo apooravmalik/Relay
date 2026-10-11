@@ -6,7 +6,7 @@ usage() {
   cat <<'EOF'
 Usage:
   relay doctor [--vm NAME]
-  relay push --project DIR [--vm NAME] [--include UNTRACKED_FILE]
+  relay push --project DIR [--vm NAME]
   relay connect --project DIR [--vm NAME]
   relay pull --project DIR [--vm NAME] [--apply] > remote.patch
 
@@ -107,12 +107,10 @@ command_doctor() {
 
 command_push() {
   local project= vm=relay-v0
-  local -a includes=()
   while [[ $# -gt 0 ]]; do
     case $1 in
       --project) project=${2:-}; shift 2 ;;
       --vm) vm=${2:-}; shift 2 ;;
-      --include) includes+=("${2:-}"); shift 2 ;;
       *) die "unknown push option: $1" ;;
     esac
   done
@@ -139,18 +137,17 @@ command_push() {
   shasum -a 256 "$temp/staged.patch" | awk '{print "staged_sha256=" $1}' >> "$temp/manifest"
   shasum -a 256 "$temp/worktree.patch" | awk '{print "worktree_sha256=" $1}' >> "$temp/manifest"
 
-  if ((${#includes[@]})); then
-    local item
-    for item in "${includes[@]}"; do
-      [[ "$item" != /* && "$item" != .. && "$item" != ../* && "$item" != */../* ]] || die "--include must be a relative file inside the project: $item"
-      git -C "$project" ls-files --others --exclude-standard --error-unmatch -- "$item" >/dev/null || die "--include must name an untracked, non-ignored file: $item"
-    done
-    tar -C "$project" -cf "$temp/untracked.tar" "${includes[@]}"
-    printf '%s\n' "${includes[@]}" > "$temp/untracked.paths"
+  local -a untracked=()
+  local item
+  while IFS= read -r -d '' item; do
+    untracked+=("$item")
+  done < <(git -C "$project" ls-files --others --exclude-standard -z)
+  if ((${#untracked[@]})); then
+    COPYFILE_DISABLE=1 tar -C "$project" -cf "$temp/untracked.tar" -- "${untracked[@]}"
   fi
 
   local -a payload=(base.bundle manifest staged.patch worktree.patch)
-  [[ -f "$temp/untracked.tar" ]] && payload+=(untracked.tar untracked.paths)
+  [[ -f "$temp/untracked.tar" ]] && payload+=(untracked.tar)
   COPYFILE_DISABLE=1 tar -C "$temp" -czf "$archive" "${payload[@]}"
   printf 'Uploading %s to %s…\n' "$name" "$vm" >&2
   ssh_vm "$vm" "mkdir -p \"\$HOME/.relay-v0/incoming\" \"\$HOME/.relay-v0/workspaces\""

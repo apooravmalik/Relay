@@ -193,7 +193,7 @@ The manifest should describe, at minimum:
 - staged changes
 - unstaged changes
 - deleted files
-- selected untracked files
+- non-ignored untracked files
 
 ### Runtime
 
@@ -299,7 +299,7 @@ Relay should transfer only:
 - modified files
 - staged modifications
 - deletions
-- selected untracked files
+- non-ignored untracked files
 
 This prevents unnecessary transfer of the complete repository on every push.
 
@@ -1032,7 +1032,7 @@ The first useful version should intentionally support a narrow environment.
 - PostgreSQL
 - Redis
 - local uncommitted changes
-- selected untracked files
+- non-ignored untracked files
 - Codex or shell
 - tmux terminal session
 
@@ -1545,7 +1545,7 @@ The initial project is considered successful when all of the following work reli
 
 1. A developer starts with a Git repository locally.
 2. The repository contains uncommitted source changes.
-3. At least one selected untracked file is present.
+3. At least one non-ignored untracked file is present.
 4. The project requires PostgreSQL and Redis.
 5. The developer runs `relay push`.
 6. A remote Linux VM is provisioned.
@@ -1579,7 +1579,7 @@ The initial project is considered successful when all of the following work reli
 - detect Git repository
 - capture branch/base SHA
 - capture dirty state
-- capture selected untracked files
+- capture non-ignored untracked files
 - generate Workspace Manifest
 
 ### Milestone 3 — Workspace Restore
