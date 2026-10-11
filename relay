@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+# Relay prototype: move a dirty Git working tree to an SSH target.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  relay doctor [--vm NAME]
+  relay push --project DIR [--vm NAME] [--include UNTRACKED_FILE]
+  relay connect --project DIR [--vm NAME]
+  relay pull --project DIR [--vm NAME] [--apply] > remote.patch
+
+Without --apply, pull writes the remote delta as a patch. --apply checks that
+the local Git base is unchanged and that the patch applies cleanly first.
+EOF
+}
+
+die() { printf 'relay: %s\n' "$*" >&2; exit 1; }
+
+require() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
+
+vm_config() {
+  local vm=$1
+  local config="${HOME}/.lima/${vm}/ssh.config"
+  [[ -f "$config" ]] || return 1
+  printf '%s\n' "$config"
+}
+
+vm_host() {
+  local vm=$1 config
+  if config=$(vm_config "$vm"); then
+    awk '/^Host / { print $2; exit }' "$config"
+  else
+    printf '%s\n' "$vm"
+  fi
+}
+
+ssh_vm() {
+  local vm=$1
+  shift
+  local config
+  if config=$(vm_config "$vm"); then
+    ssh -F "$config" "$(vm_host "$vm")" "$@"
+  else
+    ssh "$(vm_host "$vm")" "$@"
+  fi
+}
+
+ssh_vm_tty() {
+  local vm=$1
+  shift
+  local config
+  if config=$(vm_config "$vm"); then
+    ssh -tt -F "$config" "$(vm_host "$vm")" "$@"
+  else
+    ssh -tt "$(vm_host "$vm")" "$@"
+  fi
+}
+
+scp_to_vm() {
+  local vm=$1 source=$2 target=$3
+  local config
+  if config=$(vm_config "$vm"); then
+    scp -q -F "$config" "$source" "$(vm_host "$vm"):$target"
+  else
+    scp -q "$source" "$(vm_host "$vm"):$target"
+  fi
+}
+
+project_path() {
+  local project=$1
+  [[ -d "$project" ]] || die "project directory does not exist: $project"
+  git -C "$project" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not a Git working tree: $project"
+  (cd "$project" && pwd -P)
+}
+
+workspace_name() {
+  local project=$1
+  printf '%s' "$(basename "$project")" | tr -cs 'A-Za-z0-9._-' '-'
+}
+
+command_doctor() {
+  local vm=relay-v0
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --vm) vm=${2:-}; shift 2 ;;
+      *) die "unknown doctor option: $1" ;;
+    esac
+  done
+
+  require git
+  require ssh
+  require scp
+  require tar
+  printf 'host git: '; git --version
+  printf 'host ssh: '; ssh -V 2>&1 | head -1
+  if vm_config "$vm" >/dev/null; then
+    require limactl
+    printf 'lima: '; limactl --version
+  else
+    printf 'remote SSH host: %s\n' "$vm"
+  fi
+  printf 'vm: '
+  ssh_vm "$vm" 'printf "%s " "$(hostname)"; git --version; tmux -V'
+}
+
+command_push() {
+  local project= vm=relay-v0
+  local -a includes=()
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --project) project=${2:-}; shift 2 ;;
+      --vm) vm=${2:-}; shift 2 ;;
+      --include) includes+=("${2:-}"); shift 2 ;;
+      *) die "unknown push option: $1" ;;
+    esac
+  done
+  [[ -n "$project" ]] || die "push requires --project DIR"
+  require git
+  require ssh
+  require scp
+  require tar
+  project=$(project_path "$project")
+
+  local base name temp archive remote_incoming remote_workspace
+  base=$(git -C "$project" rev-parse HEAD)
+  name=$(workspace_name "$project")
+  temp=$(mktemp -d "${TMPDIR:-/tmp}/relay.XXXXXX")
+  trap 'rm -rf "$temp"' RETURN
+  archive="$temp/$name.tgz"
+  remote_incoming=".relay-v0/incoming/$name.tgz"
+  remote_workspace=".relay-v0/workspaces/$name"
+
+  git -C "$project" bundle create "$temp/base.bundle" HEAD
+  git -C "$project" diff --binary --full-index --cached HEAD > "$temp/staged.patch"
+  git -C "$project" diff --binary --full-index > "$temp/worktree.patch"
+  printf 'base=%s\n' "$base" > "$temp/manifest"
+  shasum -a 256 "$temp/staged.patch" | awk '{print "staged_sha256=" $1}' >> "$temp/manifest"
+  shasum -a 256 "$temp/worktree.patch" | awk '{print "worktree_sha256=" $1}' >> "$temp/manifest"
+
+  if ((${#includes[@]})); then
+    local item
+    for item in "${includes[@]}"; do
+      [[ "$item" != /* && "$item" != .. && "$item" != ../* && "$item" != */../* ]] || die "--include must be a relative file inside the project: $item"
+      git -C "$project" ls-files --others --exclude-standard --error-unmatch -- "$item" >/dev/null || die "--include must name an untracked, non-ignored file: $item"
+    done
+    tar -C "$project" -cf "$temp/untracked.tar" "${includes[@]}"
+    printf '%s\n' "${includes[@]}" > "$temp/untracked.paths"
+  fi
+
+  local -a payload=(base.bundle manifest staged.patch worktree.patch)
+  [[ -f "$temp/untracked.tar" ]] && payload+=(untracked.tar untracked.paths)
+  COPYFILE_DISABLE=1 tar -C "$temp" -czf "$archive" "${payload[@]}"
+  printf 'Uploading %s to %s…\n' "$name" "$vm" >&2
+  ssh_vm "$vm" "mkdir -p \"\$HOME/.relay-v0/incoming\" \"\$HOME/.relay-v0/workspaces\""
+  scp_to_vm "$vm" "$archive" "$remote_incoming"
+
+  ssh_vm "$vm" bash -s -- "$remote_incoming" "$remote_workspace" <<'REMOTE'
+set -euo pipefail
+archive="$HOME/$1"
+workspace="$HOME/$2"
+[[ ! -e "$workspace" ]] || { echo "remote workspace already exists: $workspace" >&2; exit 1; }
+temp=$(mktemp -d)
+trap 'rm -rf "$temp"' EXIT
+tar -xzf "$archive" -C "$temp"
+base=$(sed -n 's/^base=//p' "$temp/manifest")
+git clone --no-checkout "$temp/base.bundle" "$workspace"
+git -C "$workspace" checkout --detach "$base"
+if [[ -s "$temp/staged.patch" ]]; then
+  git -C "$workspace" apply --check --index "$temp/staged.patch"
+  git -C "$workspace" apply --index "$temp/staged.patch"
+fi
+if [[ -s "$temp/worktree.patch" ]]; then
+  git -C "$workspace" apply --check "$temp/worktree.patch"
+  git -C "$workspace" apply "$temp/worktree.patch"
+fi
+if [[ -f "$temp/untracked.tar" ]]; then
+  tar -xf "$temp/untracked.tar" -C "$workspace"
+fi
+expected_staged=$(sed -n 's/^staged_sha256=//p' "$temp/manifest")
+expected_worktree=$(sed -n 's/^worktree_sha256=//p' "$temp/manifest")
+actual_staged=$(git -C "$workspace" diff --binary --full-index --cached HEAD | sha256sum | awk '{print $1}')
+actual_worktree=$(git -C "$workspace" diff --binary --full-index | sha256sum | awk '{print $1}')
+[[ "$actual_staged" == "$expected_staged" ]] || { echo 'staged patch verification failed' >&2; exit 1; }
+[[ "$actual_worktree" == "$expected_worktree" ]] || { echo 'worktree patch verification failed' >&2; exit 1; }
+index_backup="$temp/index"
+cp "$workspace/.git/index" "$index_backup"
+git -C "$workspace" add -A
+tree=$(git -C "$workspace" write-tree)
+cp "$index_backup" "$workspace/.git/index"
+snapshot=$(GIT_AUTHOR_NAME=Relay GIT_AUTHOR_EMAIL=relay@localhost GIT_COMMITTER_NAME=Relay GIT_COMMITTER_EMAIL=relay@localhost git -C "$workspace" commit-tree "$tree" -p "$base" <<<'Relay handoff snapshot')
+git -C "$workspace" update-ref refs/relay/synced "$snapshot"
+mkdir -p "$HOME/.relay-v0/meta"
+printf '%s\n' "$base" > "$HOME/.relay-v0/meta/$(basename "$workspace").base"
+rm -f "$archive"
+printf 'Restored and verified %s\n' "$workspace"
+REMOTE
+  trap - RETURN
+  rm -rf "$temp"
+  printf 'Connect with: %s connect --project %q --vm %q\n' "$0" "$project" "$vm"
+}
+
+command_connect() {
+  local project= vm=relay-v0
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --project) project=${2:-}; shift 2 ;;
+      --vm) vm=${2:-}; shift 2 ;;
+      *) die "unknown connect option: $1" ;;
+    esac
+  done
+  [[ -n "$project" ]] || die "connect requires --project DIR"
+  project=$(project_path "$project")
+  ssh_vm_tty "$vm" "cd \"\$HOME/.relay-v0/workspaces/$(workspace_name "$project")\" && exec tmux new-session -A -s relay"
+}
+
+command_pull() {
+  local project= vm=relay-v0 apply=false
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --project) project=${2:-}; shift 2 ;;
+      --vm) vm=${2:-}; shift 2 ;;
+      --apply) apply=true; shift ;;
+      *) die "unknown pull option: $1" ;;
+    esac
+  done
+  [[ -n "$project" ]] || die "pull requires --project DIR"
+  project=$(project_path "$project")
+  local workspace remote_base local_base patch
+  workspace=".relay-v0/workspaces/$(workspace_name "$project")"
+  remote_base=$(ssh_vm "$vm" "git -C \"\$HOME/$workspace\" rev-parse --verify refs/relay/synced^" 2>/dev/null) || die "remote handoff snapshot is missing; push the project again"
+  local_base=$(git -C "$project" rev-parse HEAD)
+  [[ "$local_base" == "$remote_base" ]] || die "local HEAD changed since push; inspect/export the patch before applying"
+  [[ -z "$(ssh_vm "$vm" "git -C \"\$HOME/$workspace\" ls-files --others --exclude-standard")" ]] || die "remote has new untracked files; export the patch and move those files manually"
+  if [[ "$apply" == false ]]; then
+    ssh_vm "$vm" "git -C \"\$HOME/$workspace\" diff --binary --full-index refs/relay/synced"
+    return
+  fi
+  patch=$(mktemp "${TMPDIR:-/tmp}/relay-pull.XXXXXX")
+  trap 'rm -f "$patch"' RETURN
+  ssh_vm "$vm" "git -C \"\$HOME/$workspace\" diff --binary --full-index refs/relay/synced" > "$patch"
+  git -C "$project" apply --check "$patch" || die "remote change conflicts with the local workspace; rerun pull without --apply to inspect it"
+  git -C "$project" apply "$patch"
+  ssh_vm "$vm" bash -s -- "$workspace" <<'REMOTE'
+set -euo pipefail
+workspace="$HOME/$1"
+base=$(git -C "$workspace" rev-parse refs/relay/synced^)
+temp=$(mktemp -d)
+trap 'rm -rf "$temp"' EXIT
+cp "$workspace/.git/index" "$temp/index"
+git -C "$workspace" add -A
+tree=$(git -C "$workspace" write-tree)
+cp "$temp/index" "$workspace/.git/index"
+snapshot=$(GIT_AUTHOR_NAME=Relay GIT_AUTHOR_EMAIL=relay@localhost GIT_COMMITTER_NAME=Relay GIT_COMMITTER_EMAIL=relay@localhost git -C "$workspace" commit-tree "$tree" -p "$base" <<<'Relay handoff snapshot')
+git -C "$workspace" update-ref refs/relay/synced "$snapshot"
+REMOTE
+  trap - RETURN
+  rm -f "$patch"
+  printf 'Applied remote delta to %s\n' "$project" >&2
+}
+
+case ${1:-} in
+  doctor) shift; command_doctor "$@" ;;
+  push) shift; command_push "$@" ;;
+  connect) shift; command_connect "$@" ;;
+  pull) shift; command_pull "$@" ;;
+  -h|--help|help|'') usage ;;
+  *) die "unknown command: $1" ;;
+esac
