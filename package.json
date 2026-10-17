@@ -1,0 +1,10 @@
+{
+  "name": "relay-v0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "pwa:dev": "node pwa/server.mjs",
+    "test": "node --test pwa/test/*.test.mjs"
+  }
+}
+
