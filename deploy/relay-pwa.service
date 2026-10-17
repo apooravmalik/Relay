@@ -1,0 +1,22 @@
+[Unit]
+Description=Relay private mobile controller
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=relay
+Group=relay
+WorkingDirectory=/opt/relay
+EnvironmentFile=/etc/relay-pwa.env
+ExecStart=/usr/local/bin/node /opt/relay/pwa/server.mjs
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/relay/.relay-v0/controller
+
+[Install]
+WantedBy=multi-user.target

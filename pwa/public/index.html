@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#07111f">
+    <meta name="description" content="Relay private workspace controller">
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="stylesheet" href="/styles.css?v=mobile-ui-2">
+    <title>Relay</title>
+  </head>
+  <body>
+    <main class="app-shell">
+      <section id="home-screen">
+        <header class="topbar">
+          <a class="brand" href="/" aria-label="Relay workspaces">Relay<span>_</span></a>
+          <div class="private-network"><span aria-hidden="true"></span>Private network</div>
+        </header>
+        <section class="intro" aria-labelledby="page-title">
+          <h1 id="page-title">Your workspaces</h1>
+          <p>Continue work running on your private VM.</p>
+        </section>
+        <div id="workspace-list" class="workspace-list" aria-live="polite">
+          <p class="loading">Loading workspaces…</p>
+        </div>
+      </section>
+
+      <section id="workspace-screen" hidden>
+        <header class="workspace-topbar">
+          <button id="back-home" class="icon-button" type="button" aria-label="Back to workspaces">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+          </button>
+          <div class="workspace-title"><strong id="workspace-name"></strong><span id="workspace-meta"></span></div>
+          <div class="private-dot" aria-label="Private Tailnet connection"></div>
+        </header>
+
+        <div class="workspace-tabs" role="tablist" aria-label="Workspace view">
+          <button id="chats-tab" class="tab selected" type="button" role="tab" aria-controls="conversation-list-panel" aria-selected="true">Chats</button>
+          <button id="changes-tab" class="tab" type="button" role="tab" aria-controls="changes-panel" aria-selected="false">Changes <span id="change-count"></span></button>
+        </div>
+
+        <section id="conversation-list-panel" class="panel" role="tabpanel" aria-labelledby="chats-tab" aria-live="polite">
+          <div class="panel-heading">
+            <div><h1>Conversations</h1><p>Saved on this VM. Hiding one does not delete it.</p></div>
+            <button id="new-chat" class="primary compact" type="button">New chat</button>
+          </div>
+          <div id="conversation-list" class="conversation-list"></div>
+        </section>
+
+        <section id="chat-panel" class="chat-panel" hidden>
+          <div class="chat-heading">
+            <button id="back-to-chats" class="icon-button small" type="button" aria-label="Back to conversations">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+            </button>
+            <div><strong id="chat-title"></strong><span id="chat-status" role="status" aria-live="polite">Ready</span></div>
+            <button id="hide-chat" class="text-button" type="button">Hide</button>
+          </div>
+          <div id="message-list" class="message-list"></div>
+          <button id="review-changes" class="change-summary" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 2h8l4 4v16H6zM14 2v5h5M9 13h6M9 17h6"/></svg>
+            <span id="review-count">Changes</span>
+            <svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </button>
+          <form id="composer" class="composer">
+            <button id="voice-button" class="voice-button" type="button" aria-label="Dictate a message" aria-pressed="false">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3M9 21h6"/></svg>
+            </button>
+            <label class="composer-input"><span class="sr-only">Message Codex</span><textarea id="prompt" rows="1" maxlength="8000" placeholder="Ask Codex" aria-describedby="composer-note"></textarea></label>
+            <button class="send-button" type="submit" aria-label="Send message">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 4 16 8-16 8 3-8z"/></svg>
+            </button>
+          </form>
+          <p id="composer-note" class="composer-note">Codex runs with full VM access for this private Relay workspace.</p>
+        </section>
+
+        <section id="changes-panel" class="panel" role="tabpanel" aria-labelledby="changes-tab" hidden aria-live="polite">
+          <div class="panel-heading"><div><h1>Changed files</h1><p>Only changes made on the VM since the last handoff.</p></div></div>
+          <div id="changes-list" class="changes-list"></div>
+        </section>
+      </section>
+    </main>
+
+    <dialog id="file-viewer" class="file-viewer">
+      <header><strong id="file-title"></strong><button id="close-file" class="icon-button small" type="button" aria-label="Close file preview">×</button></header>
+      <div class="file-actions"><button id="show-diff" class="text-button selected" type="button">Diff</button><button id="show-file" class="text-button" type="button">File</button></div>
+      <pre id="file-content"></pre>
+    </dialog>
+    <script type="module" src="/app.js?v=mobile-ui-2"></script>
+  </body>
+</html>
