@@ -26,3 +26,45 @@ workspace.
 
 The test target is not a mount. Relay copies an archive over SSH, matching the
 future cloud transport boundary.
+
+## Private phone PWA
+
+The PWA is a private controller for the existing VM—not a browser terminal. It
+lists registered workspaces, opens saved Codex chats, streams a new prompt,
+shows changed files and diffs, and uses browser speech-to-text when supported.
+Codex turns launched by the PWA use full VM access with no command approval
+prompt. Only grant the Tailnet owner access, and do not keep unrelated secrets
+or credentials readable by the `relay` user.
+
+It deliberately does **not** expose a raw shell, arbitrary filesystem reads, or
+the Codex app-server protocol. A chat can be hidden from the Relay UI without
+deleting its Codex history or its workspace. An active tmux-owned chat remains
+read-only; continue it in Termius instead of creating a competing writer.
+
+For local visual work only:
+
+```bash
+RELAY_ALLOW_LOCAL_DEV=1 \
+RELAY_WORKSPACE_ROOTS="$PWD" \
+npm run pwa:dev
+```
+
+VM deployment uses [deploy/relay-pwa.service](deploy/relay-pwa.service) with an
+environment file outside Git:
+
+```ini
+RELAY_ALLOWED_TAILSCALE_LOGIN=your-tailnet-login@example.com
+RELAY_WORKSPACE_ROOTS=/home/relay/.relay-v0/workspaces/GeM_PO_Verification
+RELAY_PREFERENCES_FILE=/home/relay/.relay-v0/controller/preferences.json
+RELAY_PWA_HOST=127.0.0.1
+RELAY_PWA_PORT=4388
+```
+
+After starting the service, publish only through private Tailscale Serve:
+
+```bash
+sudo tailscale serve --bg 4388
+```
+
+Never use `tailscale funnel` for Relay. The controller stays on loopback and
+requires the owner login injected by Tailscale Serve.

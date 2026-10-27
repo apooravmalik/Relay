@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import test from 'node:test';
-import { countPorcelainRecords, inspectWorkspace, parseWorkspaceRoots } from '../lib/workspaces.mjs';
+import { countPorcelainRecords, inspectWorkspace, parseWorkspaceRoots, workspaceFile } from '../lib/workspaces.mjs';
 
 const run = promisify(execFile);
 
@@ -38,3 +38,25 @@ test('inspectWorkspace returns only safe Git metadata', async () => {
   assert.equal(typeof workspace.id, 'string');
   assert.equal('path' in workspace, false);
 });
+
+test('workspace file preview cannot read a secret or escape the changed workspace', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'relay-preview-test-'));
+  await run('git', ['init', root]);
+  await writeFile(path.join(root, 'safe.txt'), 'safe\n');
+  await writeFile(path.join(root, '.env'), 'SECRET=not-for-preview\n');
+
+  await assert.doesNotReject(() => workspaceFile(root, 'safe.txt'));
+  await assert.rejects(() => workspaceFile(root, '.env'), /Sensitive files/);
+  await assert.rejects(() => workspaceFile(root, '../outside.txt'), /Invalid file path/);
+});
+
+test('workspace change list expands an untracked directory into files', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'relay-untracked-test-'));
+  await run('git', ['init', root]);
+  await mkdir(path.join(root, 'new-directory'));
+  await writeFile(path.join(root, 'new-directory', 'visible.txt'), 'visible\n');
+  const workspace = await inspectWorkspace(root);
+  assert.equal(workspace.changedFileCount, 1);
+  await assert.doesNotReject(() => workspaceFile(root, 'new-directory/visible.txt'));
+});
+
