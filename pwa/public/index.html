@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#07111f">
+    <meta name="description" content="Relay private workspace controller">
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="stylesheet" href="/styles.css">
+    <title>Relay</title>
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="Relay workspaces">Relay<span>_</span></a>
+        <div class="private-network" aria-label="Private Tailnet connection">
+          <span aria-hidden="true">●</span> Private network
+        </div>
+      </header>
+
+      <section class="hero" aria-labelledby="page-title">
+        <h1 id="page-title">Your workspaces</h1>
+        <p>Control your cloud development environments.</p>
+      </section>
+
+      <section aria-live="polite" aria-label="Registered workspaces">
+        <div id="workspace-list" class="workspace-list">
+          <p class="loading">Loading private workspace status…</p>
+        </div>
+      </section>
+
+      <section id="workspace-detail" class="workspace-detail" hidden aria-live="polite"></section>
+    </main>
+    <nav class="bottom-nav" aria-label="Primary navigation">
+      <button class="nav-item selected" type="button" aria-current="page">Workspaces</button>
+      <button class="nav-item" type="button" disabled>Changes</button>
+    </nav>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

@@ -932,6 +932,28 @@ LOCAL
 
 Local becomes authoritative.
 
+### Workspace bootstrap pull (non-Git)
+
+Relay must also support a workspace that was created directly on the VM and
+therefore has no Git base commit or prior Relay handoff snapshot. In that case,
+`relay pull` cannot safely construct a patch; it needs a distinct full-workspace
+export mode.
+
+```text
+CLOUD-only workspace
+  ↓
+relay pull --workspace-export --destination /local/path
+  ↓
+LOCAL bootstrap copy
+```
+
+The destination must be new or explicitly empty. Relay should transfer the
+entire selected workspace, write a manifest with file paths, sizes, and hashes,
+verify it after transfer, and leave the VM source untouched. It must not infer a
+merge target, delete local files, or advance ownership until verification is
+complete. A later incremental pull can use a fresh Git base after the user
+initializes Git locally or asks Relay to establish a snapshot.
+
 This avoids the complexity of:
 
 - simultaneous editing

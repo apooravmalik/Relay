@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Relay: private workspace infrastructure</title>
+  <style>
+    :root { --bg:#07111f; --surface:#0d1b2d; --surface-2:#10253d; --ink:#f2f7ff; --muted:#a8b8cf; --line:#3a5875; --green:#58e6a4; --blue:#82b5ff; --amber:#ffc86f; --red:#ff9da6; }
+    * { box-sizing:border-box; } body { background:var(--bg); color:var(--ink); font:16px/1.5 Inter,ui-sans-serif,system-ui,sans-serif; margin:0; } main { margin:auto; max-width:1120px; padding:48px 24px 72px; } header { max-width:760px; } .eyebrow { color:var(--green); font-size:.78rem; font-weight:800; letter-spacing:.11em; text-transform:uppercase; } h1 { font-size:clamp(2.25rem,5vw,4rem); letter-spacing:-.055em; line-height:1; margin:10px 0 16px; } h2 { font-size:1.25rem; letter-spacing:-.02em; margin:0 0 6px; } p { color:var(--muted); margin:0; } .legend { display:flex; flex-wrap:wrap; gap:8px; margin:26px 0 16px; } .pill { border:1px solid var(--line); border-radius:999px; color:var(--muted); font-size:.8rem; font-weight:700; padding:5px 10px; } .pill.now { border-color:var(--green); color:var(--green); } .pill.next { border-color:var(--amber); color:var(--amber); } .diagram { background:linear-gradient(140deg,#0b1b2e,#081422); border:1px solid var(--line); border-radius:24px; padding:12px; } svg { display:block; height:auto; width:100%; } .next-step { background:#191a21; border:1px dashed var(--amber); border-radius:14px; color:var(--muted); margin-top:14px; padding:13px 16px; } .next-step b { color:var(--amber); } .section { margin-top:42px; } .grid { display:grid; gap:14px; grid-template-columns:repeat(2,minmax(0,1fr)); } .card { background:var(--surface); border:1px solid var(--line); border-radius:16px; min-width:0; padding:18px; } .card strong { display:block; margin-bottom:5px; } table { border-collapse:collapse; margin-top:15px; width:100%; } th,td { border-bottom:1px solid var(--line); padding:13px 9px; text-align:left; vertical-align:top; } th { color:var(--muted); font-size:.74rem; letter-spacing:.09em; text-transform:uppercase; } .ok { color:var(--green); font-weight:800; } .planned { color:var(--amber); font-weight:800; } .fail { color:var(--red); font-weight:800; } .rule { border-left:3px solid var(--green); color:var(--muted); margin-top:18px; padding:8px 13px; } code { background:#06111d; border:1px solid var(--line); border-radius:5px; color:#e4eeff; padding:1px 5px; } @media (max-width:700px) { main { padding:30px 14px 50px; } .grid { grid-template-columns:1fr; } table { font-size:.86rem; } th,td { padding:10px 6px; } .diagram { padding:4px; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Relay infrastructure · P1 now, next safe step</div>
+    <h1>Your VM is the workspace.<br>Your phone controls it.</h1>
+    <p>One private Tailnet connects three devices. Today, the Mac starts transfers. The next backend service lets the phone request a safe transfer while a Mac-side agent performs it locally.</p>
+  </header>
+
+  <div class="legend"><span class="pill now">Solid green · works now</span><span class="pill next">Dashed amber · next build</span><span class="pill">Private Tailnet only · no public inbound access</span></div>
+
+  <section class="diagram" aria-label="Relay architecture and workspace flows">
+    <svg viewBox="0 0 1120 590" role="img" aria-labelledby="diagram-title diagram-desc">
+      <title id="diagram-title">Relay private workspace infrastructure</title>
+      <desc id="diagram-desc">Phone and Mac connect privately to the Relay VM. Phone controls the PWA and Codex. Mac pushes to and pulls from the VM workspace. A planned Mac Relay Agent enables a phone-requested sync without VM access to Mac.</desc>
+      <defs>
+        <marker id="green-arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#58e6a4"/></marker>
+        <marker id="amber-arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#ffc86f"/></marker>
+        <style>
+          .tailnet{fill:#0a1728;stroke:#3a5875;stroke-width:2}.vm{fill:#10253d;stroke:#82b5ff;stroke-width:2}.node{fill:#0d1b2d;stroke:#3a5875;stroke-width:2}.active{fill:#10253d;stroke:#58e6a4;stroke-width:2}.future{fill:#1b1c24;stroke:#ffc86f;stroke-width:2;stroke-dasharray:7 6}.label{fill:#f2f7ff;font:700 20px Inter,system-ui}.small{fill:#a8b8cf;font:15px Inter,system-ui}.tiny{fill:#a8b8cf;font:12px Inter,system-ui}.path-now{stroke:#58e6a4;stroke-width:3;fill:none;marker-end:url(#green-arrow)}.path-next{stroke:#ffc86f;stroke-width:3;stroke-dasharray:8 7;fill:none;marker-end:url(#amber-arrow)}
+        </style>
+      </defs>
+
+      <rect id="tailnet" class="tailnet" x="20" y="52" width="1080" height="512" rx="24"/><text class="small" x="48" y="85">PRIVATE TAILSCALE TAILNET</text><text class="tiny" x="48" y="106">Every connection is authenticated. Relay exposes no public service.</text>
+
+      <rect id="phone" class="node" x="65" y="151" width="230" height="125" rx="17"/><text class="label" x="91" y="190">Phone</text><text class="small" x="91" y="216">Relay PWA</text><text class="tiny" x="91" y="243">chat · files · previews</text>
+
+      <rect id="mac" class="node" x="65" y="372" width="230" height="125" rx="17"/><text class="label" x="91" y="411">Mac</text><text class="small" x="91" y="437">Relay CLI</text><text class="tiny" x="91" y="464">your local workspace</text>
+
+      <rect id="vm" class="vm" x="520" y="122" width="515" height="375" rx="21"/><text class="small" x="550" y="155">DIGITALOCEAN UBUNTU VM · PERSISTENT DISK</text>
+      <rect id="pwa" class="active" x="555" y="184" width="190" height="94" rx="14"/><text class="label" x="579" y="218">Relay PWA</text><text class="tiny" x="579" y="244">private HTTPS + API</text><text class="tiny" x="579" y="264">served via Tailscale</text>
+      <rect id="codex" class="active" x="795" y="184" width="205" height="94" rx="14"/><text class="label" x="820" y="218">Codex + tmux</text><text class="tiny" x="820" y="244">runs in the VM</text><text class="tiny" x="820" y="264">writes one workspace</text>
+      <rect id="workspace" class="node" x="555" y="351" width="445" height="105" rx="14"/><text class="label" x="580" y="389">Workspace on the VM</text><text class="small" x="580" y="415">code · uploads · Git · logs · preview processes</text><text class="tiny" x="580" y="438">This is the long-lived source of active work.</text>
+
+      <path id="phone-pwa" class="path-now" d="M295 213 H555"/><text class="tiny" x="377" y="200">2 · chat and status</text>
+      <path id="pwa-codex" class="path-now" d="M745 231 H795"/><text class="tiny" x="753" y="217">runs</text>
+      <path id="codex-workspace" class="path-now" d="M897 278 V315 H777 V351"/><text class="tiny" x="825" y="309">changes</text>
+      <path id="mac-push" class="path-now" d="M295 402 C380 402,440 385,555 385"/><text class="tiny" x="385" y="374">4 · push Mac → VM</text>
+      <path id="vm-pull" class="path-now" d="M555 435 C440 475,380 474,295 474"/><text class="tiny" x="382" y="492">3 · pull/export VM → Mac</text>
+
+      <text class="tiny" x="48" y="538">Solid paths are the private, encrypted capabilities that work today.</text>
+    </svg>
+  </section>
+  <div class="next-step"><b>Next backend service:</b> PWA records a sync request → Mac Relay Agent polls it outward → local Relay CLI transfers the registered workspace. The VM never SSHes into your Mac.</div>
+
+  <section class="section">
+    <h2>Four integrated scenarios — and their safe failure paths</h2>
+    <p>The outcome is either a verified new workspace state, or both original states remain intact.</p>
+    <table>
+      <thead><tr><th>Flow</th><th>What happens</th><th>When it fails</th></tr></thead>
+      <tbody>
+        <tr><td><b>1. Set up Mac → VM</b></td><td><span class="ok">Now</span> <code>relay push</code> uses the registered VM workspace and a private SSH/Tailscale connection.</td><td><span class="fail">Fail safe:</span> unreachable VM, bad credentials, upload or hash failure leaves the Mac unchanged; the VM does not become the new owner.</td></tr>
+        <tr><td><b>2. PWA → Codex → Mobile</b></td><td><span class="ok">Now</span> the phone reaches the PWA privately; the PWA runs Codex inside the chosen VM workspace and reports output/files back.</td><td><span class="fail">Fail safe:</span> phone off Tailnet or VM down means no chat connection; saved VM state remains on disk. A chat may stop only its own active Codex turn.</td></tr>
+        <tr><td><b>3. VM → Mac</b></td><td><span class="ok">Now</span> Git delta pull; a one-time full export has proven the non-Git VM-only workspace case.</td><td><span class="fail">Fail safe:</span> changed base or patch conflict does not apply. Full export only targets a new/empty Mac folder; it never guesses a merge or deletes local files.</td></tr>
+        <tr><td><b>4. Mac → VM</b></td><td><span class="ok">Now</span> Git state, patches and non-ignored untracked files can be sent from the Mac.</td><td><span class="fail">Fail safe:</span> if the VM workspace changed after the handoff, Relay must surface conflict instead of overwriting cloud work.</td></tr>
+        <tr><td><b>Phone requests a Mac sync</b></td><td><span class="planned">Next</span> a small VM job service records a workspace-ID-only request; the Mac Agent checks outward through Tailnet and performs the local transfer.</td><td><span class="fail">Fail safe:</span> sleeping/offline Mac keeps the job queued. The PWA and Codex never receive arbitrary Mac shell access or filesystem paths.</td></tr>
+      </tbody>
+    </table>
+    <div class="rule"><b>Non-negotiable rule:</b> exactly one side owns a writable workspace at a time. A hash-verified handoff changes ownership; a failed transfer changes nothing.</div>
+  </section>
+
+  <section class="section grid">
+    <article class="card"><strong>What is proven today</strong><p>Private phone control of the VM, Codex work on the VM, Tailnet-only preview URLs, Mac-initiated Git handoffs, and a complete non-Git workspace export to a new Mac directory.</p></article>
+    <article class="card"><strong>Smallest next backend service</strong><p>A queue plus a Mac-side polling agent: fixed registered workspaces, signed job IDs, manifest verification, explicit conflict states, and no inbound Mac SSH.</p></article>
+  </section>
+</main>
+</body>
+</html>
