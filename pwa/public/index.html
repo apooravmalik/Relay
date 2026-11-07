@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#07111f">
     <meta name="description" content="Relay private workspace controller">
     <link rel="manifest" href="/manifest.webmanifest">
-    <link rel="stylesheet" href="/styles.css?v=mobile-ui-2">
+    <link rel="stylesheet" href="/styles.css?v=mobile-ui-3">
     <title>Relay</title>
   </head>
   <body>
@@ -55,7 +55,7 @@
             <div><strong id="chat-title"></strong><span id="chat-status" role="status" aria-live="polite">Ready</span></div>
             <button id="hide-chat" class="text-button" type="button">Hide</button>
           </div>
-          <div id="message-list" class="message-list"></div>
+          <div id="message-list" class="message-list" aria-label="Conversation messages"></div>
           <button id="review-changes" class="change-summary" type="button">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 2h8l4 4v16H6zM14 2v5h5M9 13h6M9 17h6"/></svg>
             <span id="review-count">Changes</span>
@@ -85,6 +85,6 @@
       <div class="file-actions"><button id="show-diff" class="text-button selected" type="button">Diff</button><button id="show-file" class="text-button" type="button">File</button></div>
       <pre id="file-content"></pre>
     </dialog>
-    <script type="module" src="/app.js?v=mobile-ui-2"></script>
+    <script type="module" src="/app.js?v=mobile-ui-3"></script>
   </body>
 </html>

@@ -22,6 +22,6 @@ test('chat UI bounds scrolling and prevents concurrent sends', () => {
 });
 
 test('PWA markup versions its UI assets after a controller deployment', () => {
-  assert.match(markup, /styles\.css\?v=mobile-ui-2/);
-  assert.match(markup, /app\.js\?v=mobile-ui-2/);
+  assert.match(markup, /styles\.css\?v=mobile-ui-3/);
+  assert.match(markup, /app\.js\?v=mobile-ui-3/);
 });

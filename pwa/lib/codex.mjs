@@ -73,6 +73,7 @@ class AppServer {
   failAll(error) {
     for (const { reject } of this.pending.values()) reject(error);
     this.pending.clear();
+    this.emit({ type: 'serverError', error });
   }
 
   close() {
@@ -141,8 +142,12 @@ export async function readConversation(cwd, threadId) {
 async function streamConversation({ cwd, threadId, text, onEvent }) {
   return withServer(async (server) => {
     let complete;
-    const completeTurn = new Promise((resolve) => { complete = resolve; });
+    let fail;
+    const completeTurn = new Promise((resolve, reject) => { complete = resolve; fail = reject; });
+    // The process can exit while a request is still pending, before we await the turn.
+    completeTurn.catch(() => {});
     const removeListener = server.onEvent((event) => {
+      if (event.type === 'serverError') fail(event.error);
       if (event.type === 'approval') onEvent({ type: 'approval' });
       if (event.method === 'item/agentMessage/delta') {
         const delta = event.params.delta || event.params.text || '';

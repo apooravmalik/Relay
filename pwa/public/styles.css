@@ -64,7 +64,7 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent);
 .conversation-row strong, .conversation-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conversation-row span { color: var(--muted); font-size: .89rem; }
 .conversation-row .conversation-status { color: var(--accent); font-size: .75rem; font-weight: 700; text-transform: uppercase; }
-.chat-panel { display: grid; flex: 1 1 auto; grid-template-rows: auto minmax(0, 1fr) auto auto; min-height: 0; }
+.chat-panel { display: grid; flex: 1 1 auto; grid-template-rows: auto minmax(0, 1fr) auto auto auto; min-height: 0; }
 #workspace-screen { display: flex; flex-direction: column; height: calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom)); min-height: 0; }
 .chat-heading { align-items: center; border-bottom: 1px solid var(--border); display: flex; gap: 10px; margin: 0 -24px; min-width: 0; padding: 14px 24px; }
 .chat-heading > div { display: grid; flex: 1; gap: 2px; min-width: 0; }
@@ -75,6 +75,7 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent);
 .message-list { align-content: start; display: grid; gap: 14px; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 24px 0; }
 .message { border-radius: 17px; line-height: 1.52; max-width: 87%; min-width: 0; overflow-wrap: anywhere; padding: 13px 15px; white-space: pre-wrap; }
 .message p { margin: 0; }
+.message-author { color: var(--muted); display: block; font-size: .72rem; font-weight: 750; letter-spacing: .04em; margin-bottom: 5px; text-transform: uppercase; }
 .message.user { background: #17335a; justify-self: end; }
 .message.assistant { background: var(--panel); border: 1px solid var(--border); justify-self: start; }
 .message.system { border-left: 2px solid var(--accent); color: var(--muted); font-size: .86rem; justify-self: stretch; padding: 9px 12px; }
@@ -90,6 +91,7 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent);
 .voice-button:disabled { color: var(--muted); cursor: not-allowed; }
 .voice-button.listening { color: var(--accent); }
 .send-button { background: #397cff; color: #fff; }
+.send-button:disabled, .icon-button:disabled, .tab:disabled, .change-summary:disabled, .text-button:disabled { cursor: not-allowed; opacity: .5; }
 .composer-note { color: var(--muted); font-size: .73rem; line-height: 1.35; margin: 0 -24px; padding: 0 24px 12px; }
 .change-row { align-items: center; cursor: pointer; display: grid; gap: 12px; grid-template-columns: 26px minmax(0, 1fr) auto; padding: 16px; }
 .change-row strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

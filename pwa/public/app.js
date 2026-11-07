@@ -127,10 +127,12 @@ async function openWorkspace(workspace) {
 }
 
 function appendMessage(role, text) {
+  const follow = messageList.scrollHeight - messageList.scrollTop - messageList.clientHeight < 80;
   const message = element('article', `message ${role}`);
+  if (role !== 'system') message.append(element('span', 'message-author', role === 'user' ? 'You' : 'Codex'));
   message.append(element('p', '', text));
   messageList.append(message);
-  messageList.scrollTop = messageList.scrollHeight;
+  if (follow) messageList.scrollTop = messageList.scrollHeight;
   return message.querySelector('p');
 }
 
@@ -145,6 +147,9 @@ function setBusy(busy) {
   prompt.disabled = busy;
   composer.querySelector('[type="submit"]').disabled = busy;
   if (state.voiceSupported) document.querySelector('#voice-button').disabled = busy;
+  for (const selector of ['#back-home', '#back-to-chats', '#chats-tab', '#changes-tab', '#review-changes', '#hide-chat']) {
+    document.querySelector(selector).disabled = busy;
+  }
 }
 
 async function openConversation(conversation) {
@@ -153,6 +158,7 @@ async function openConversation(conversation) {
   chatPanel.hidden = false;
   changesPanel.hidden = true;
   document.querySelector('#chat-title').textContent = conversation.name;
+  document.querySelector('#hide-chat').hidden = !conversation.id;
   document.querySelector('#chat-status').textContent = 'Loading saved chat…';
   messageList.replaceChildren();
   if (!conversation.id) {
@@ -190,14 +196,19 @@ function handleSseChunk(chunk, assistant) {
   const data = /data: (.*)/.exec(chunk)?.[1];
   if (!event || !data) return false;
   const payload = JSON.parse(data);
-  if (event === 'delta') assistant.textContent += payload.text;
+  if (event === 'delta') {
+    const follow = messageList.scrollHeight - messageList.scrollTop - messageList.clientHeight < 80;
+    assistant.textContent += payload.text;
+    if (follow) messageList.scrollTop = messageList.scrollHeight;
+  }
   if (event === 'conversation') {
     state.conversation = payload.conversation;
     document.querySelector('#chat-title').textContent = payload.conversation.name;
+    document.querySelector('#hide-chat').hidden = false;
   }
   if (event === 'approval') appendMessage('system', 'Relay declined an unexpected interactive approval request. Standard Codex commands run with full VM access.');
-  if (event === 'error') appendMessage('system', payload.message);
-  return event === 'completed' || event === 'error';
+  if (event === 'error') throw new Error(payload.message || 'Codex could not complete the turn.');
+  return event === 'completed';
 }
 
 async function sendPrompt(event) {
@@ -231,11 +242,12 @@ async function sendPrompt(event) {
       while ((boundary = buffer.indexOf('\n\n')) >= 0) complete ||= handleSseChunk(buffer.slice(0, boundary), assistant), buffer = buffer.slice(boundary + 2);
       if (done) break;
     }
-    if (!assistant.textContent) assistant.remove();
+    if (!complete) throw new Error('Connection interrupted. The turn may still be running; check the saved conversation before sending again.');
+    if (!assistant.textContent) assistant.parentElement.remove();
     document.querySelector('#chat-status').textContent = 'Saved on VM';
-    await loadWorkspaceData();
+    await loadWorkspaceData().catch(() => {});
   } catch (error) {
-    assistant.remove();
+    if (!assistant.textContent) assistant.parentElement.remove();
     appendMessage('system', error.message);
     document.querySelector('#chat-status').textContent = 'Needs attention';
   } finally {
