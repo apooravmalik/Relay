@@ -1,11 +1,23 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import test from 'node:test';
-import { countPorcelainRecords, inspectWorkspace, parseWorkspaceRoots, workspaceFile } from '../lib/workspaces.mjs';
+import {
+  countPorcelainRecords,
+  createDirectory,
+  inspectWorkspace,
+  listProjectDirectories,
+  listProjectRoots,
+  listWorkspaceFiles,
+  parseWorkspaceRoots,
+  openDirectory,
+  saveWorkspaceUpload,
+  workspaceFile,
+  workspaceBrowseFile,
+} from '../lib/workspaces.mjs';
 
 const run = promisify(execFile);
 
@@ -35,8 +47,18 @@ test('inspectWorkspace returns only safe Git metadata', async () => {
   assert.match(workspace.branch, /^(main|master)$/);
   assert.equal(workspace.changedFileCount, 2);
   assert.equal(workspace.status, 'ready');
+  assert.equal(workspace.gitAvailable, true);
   assert.equal(typeof workspace.id, 'string');
   assert.equal('path' in workspace, false);
+});
+
+test('inspectWorkspace accepts a plain directory for Codex', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'relay-plain-workspace-test-'));
+  const workspace = await inspectWorkspace(root);
+  assert.equal(workspace.status, 'ready');
+  assert.equal(workspace.gitAvailable, false);
+  assert.equal(workspace.branch, null);
+  assert.equal(workspace.changedFileCount, null);
 });
 
 test('workspace file preview cannot read a secret or escape the changed workspace', async () => {
@@ -58,5 +80,53 @@ test('workspace change list expands an untracked directory into files', async ()
   const workspace = await inspectWorkspace(root);
   assert.equal(workspace.changedFileCount, 1);
   await assert.doesNotReject(() => workspaceFile(root, 'new-directory/visible.txt'));
+});
+
+test('workspace uploads stay in the workspace and avoid overwriting existing files', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'relay-upload-test-'));
+  const first = await saveWorkspaceUpload(root, { name: 'brief.txt', content: Buffer.from('first') });
+  const second = await saveWorkspaceUpload(root, { name: 'brief.txt', content: Buffer.from('second') });
+  assert.equal(first.path, 'uploads/brief.txt');
+  assert.equal(second.path, 'uploads/brief-2.txt');
+  assert.equal(await readFile(path.join(root, first.path), 'utf8'), 'first');
+  await assert.rejects(() => saveWorkspaceUpload(root, { name: '../escape.txt', content: Buffer.from('no') }), /Invalid upload filename/);
+});
+
+test('workspace file browser lists safe visible files and cannot escape the workspace', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'relay-file-browser-test-'));
+  const outside = await mkdtemp(path.join(tmpdir(), 'relay-file-browser-outside-'));
+  await mkdir(path.join(root, 'src'));
+  await writeFile(path.join(root, 'src', 'app.js'), 'export default 1;\n');
+  await writeFile(path.join(root, 'README.md'), 'hello\n');
+  await writeFile(path.join(root, '.env'), 'SECRET=no\n');
+  await symlink(outside, path.join(root, 'outside-link'));
+
+  const listing = await listWorkspaceFiles(root);
+  assert.deepEqual(listing.entries.map((entry) => [entry.kind, entry.name]), [['directory', 'src'], ['file', 'README.md']]);
+  assert.equal((await workspaceBrowseFile(root, 'src/app.js')).content, 'export default 1;\n');
+  await assert.rejects(() => workspaceBrowseFile(root, '.env'), /Sensitive files/);
+  await assert.rejects(() => workspaceBrowseFile(root, '../outside.txt'), /Invalid directory path/);
+});
+
+test('folder creation stays inside the VM root, skips hidden folders, and does not initialize Git', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'relay-project-root-'));
+  const outside = await mkdtemp(path.join(tmpdir(), 'relay-outside-root-'));
+  const registry = path.join(root, 'registry.json');
+  await mkdir(path.join(root, 'existing'));
+  await mkdir(path.join(root, '.hidden'));
+  await symlink(outside, path.join(root, 'outside-link'));
+  const [{ id }] = await listProjectRoots([root]);
+
+  const created = await createDirectory({ rootId: id, parentPath: '', name: 'new-project', roots: [root], registry });
+  assert.equal(created.name, 'new project');
+  assert.equal(created.gitAvailable, false);
+  await assert.rejects(() => run('git', ['-C', path.join(root, 'new-project'), 'rev-parse', '--is-inside-work-tree']));
+  await assert.rejects(() => createDirectory({ rootId: id, parentPath: '../', name: 'escape', roots: [root], registry }), /Invalid directory path/);
+  await assert.rejects(() => createDirectory({ rootId: id, parentPath: '.hidden', name: 'escape', roots: [root], registry }), /Invalid directory path/);
+
+  const listed = await listProjectDirectories(id, '', [root]);
+  assert.deepEqual(listed.directories.map((directory) => directory.name), ['existing', 'new-project']);
+  const registered = await openDirectory({ rootId: id, path: 'existing', roots: [root], registry });
+  assert.equal(registered.name, 'existing');
 });
 

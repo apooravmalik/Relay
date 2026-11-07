@@ -13,7 +13,7 @@ function isTableDivider(line) {
 function nextBlock(lines, start) {
   const line = lines[start] || '';
   if (!line.trim()) return true;
-  if (/^```/.test(line) || /^#{1,3}\s+/.test(line) || /^>\s?/.test(line)) return true;
+  if (/^```/.test(line) || /^#{1,3}\s+/.test(line)) return true;
   if (/^[-*+]\s+/.test(line) || /^\d+[.)]\s+/.test(line) || /^([-*_])(?:\s*\1){2,}\s*$/.test(line)) return true;
   return line.includes('|') && isTableDivider(lines[start + 1] || '');
 }
@@ -44,13 +44,7 @@ export function parseMarkdown(markdown) {
       blocks.push({ type: 'table', headers, rows });
       continue;
     }
-    if (/^>\s?/.test(line)) {
-      const quote = [];
-      while (index < lines.length && /^>\s?/.test(lines[index])) quote.push(lines[index++].replace(/^>\s?/, ''));
-      blocks.push({ type: 'quote', text: quote.join('\n') });
-      continue;
-    }
-    const list = /^([-*+])\s+(.+)$/.exec(line) || /^(\d+)[.)]\s+(.+)$/.exec(line);
+    const list = /^[-*+]\s+(.+)$/.exec(line) || /^\d+[.)]\s+(.+)$/.exec(line);
     if (list) {
       const ordered = /^\d+[.)]\s+/.test(line);
       const items = [];
@@ -89,10 +83,8 @@ function appendInline(parent, text) {
     if (match[1]) parent.append(Object.assign(document.createElement('code'), { textContent: match[1] }));
     else if (match[2]) {
       const href = safeUrl(match[3]);
-      if (href) {
-        const link = Object.assign(document.createElement('a'), { href, textContent: match[2], target: '_blank', rel: 'noopener' });
-        parent.append(link);
-      } else parent.append(document.createTextNode(match[0]));
+      if (href) parent.append(Object.assign(document.createElement('a'), { href, textContent: match[2], target: '_blank', rel: 'noopener' }));
+      else parent.append(document.createTextNode(match[0]));
     } else if (match[5]) parent.append(Object.assign(document.createElement('strong'), { textContent: match[5] }));
     else parent.append(Object.assign(document.createElement('em'), { textContent: match[7] }));
     cursor = match.index + match[0].length;
@@ -112,13 +104,11 @@ export function renderMarkdown(container, markdown) {
     if (block.type === 'code') {
       const code = document.createElement('code');
       code.textContent = block.text;
-      if (block.language) code.dataset.language = block.language;
       const pre = document.createElement('pre');
       pre.append(code);
       return pre;
     }
     if (block.type === 'rule') return document.createElement('hr');
-    if (block.type === 'quote') return inlineElement('blockquote', block.text);
     if (block.type === 'list') {
       const list = document.createElement(block.ordered ? 'ol' : 'ul');
       block.items.forEach((item) => list.append(inlineElement('li', item)));

@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#07111f">
     <meta name="description" content="Relay private workspace controller">
     <link rel="manifest" href="/manifest.webmanifest">
-    <link rel="stylesheet" href="/styles.css?v=mobile-ui-3">
+    <link rel="stylesheet" href="/styles.css?v=mobile-reconcile-1">
     <title>Relay</title>
   </head>
   <body>
@@ -19,6 +19,7 @@
         <section class="intro" aria-labelledby="page-title">
           <h1 id="page-title">Your workspaces</h1>
           <p>Continue work running on your private VM.</p>
+          <button id="add-workspace" class="primary" type="button">Add workspace</button>
         </section>
         <div id="workspace-list" class="workspace-list" aria-live="polite">
           <p class="loading">Loading workspaces…</p>
@@ -31,12 +32,15 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
           </button>
           <div class="workspace-title"><strong id="workspace-name"></strong><span id="workspace-meta"></span></div>
+          <button id="open-preview" class="text-button preview-button" type="button">Preview</button>
           <div class="private-dot" aria-label="Private Tailnet connection"></div>
         </header>
 
         <div class="workspace-tabs" role="tablist" aria-label="Workspace view">
           <button id="chats-tab" class="tab selected" type="button" role="tab" aria-controls="conversation-list-panel" aria-selected="true">Chats</button>
           <button id="changes-tab" class="tab" type="button" role="tab" aria-controls="changes-panel" aria-selected="false">Changes <span id="change-count"></span></button>
+          <button id="files-tab" class="tab" type="button" role="tab" aria-controls="files-panel" aria-selected="false">Files</button>
+          <button id="git-status" class="git-status" type="button" aria-label="Git status"></button>
         </div>
 
         <section id="conversation-list-panel" class="panel" role="tabpanel" aria-labelledby="chats-tab" aria-live="polite">
@@ -61,30 +65,79 @@
             <span id="review-count">Changes</span>
             <svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
           </button>
+          <div id="upload-list" class="upload-list" aria-live="polite"></div>
           <form id="composer" class="composer">
             <button id="voice-button" class="voice-button" type="button" aria-label="Dictate a message" aria-pressed="false">
               <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3M9 21h6"/></svg>
             </button>
-            <label class="composer-input"><span class="sr-only">Message Codex</span><textarea id="prompt" rows="1" maxlength="8000" placeholder="Ask Codex" aria-describedby="composer-note"></textarea></label>
+            <div class="composer-input">
+              <button id="add-menu" class="add-button" type="button" aria-label="Add to message" aria-haspopup="dialog" aria-expanded="false">+</button>
+              <input id="file-upload" type="file" accept=".pdf,.txt,.md,.csv,.json,.doc,.docx,.xls,.xlsx,.png,.jpg,.jpeg,.webp">
+              <label class="sr-only" for="prompt">Message Codex</label><textarea id="prompt" rows="1" maxlength="8000" placeholder="Ask Codex or use /commands"></textarea>
+            </div>
             <button class="send-button" type="submit" aria-label="Send message">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 4 16 8-16 8 3-8z"/></svg>
             </button>
           </form>
-          <p id="composer-note" class="composer-note">Codex runs with full VM access for this private Relay workspace.</p>
+          <button id="stop-turn" class="stop-turn" type="button" hidden>Stop</button>
         </section>
 
         <section id="changes-panel" class="panel" role="tabpanel" aria-labelledby="changes-tab" hidden aria-live="polite">
           <div class="panel-heading"><div><h1>Changed files</h1><p>Only changes made on the VM since the last handoff.</p></div></div>
           <div id="changes-list" class="changes-list"></div>
         </section>
+
+        <section id="files-panel" class="panel" role="tabpanel" aria-labelledby="files-tab" hidden aria-live="polite">
+          <div class="panel-heading"><div><h1>Files</h1><p>Browse this workspace. Select a text file to read it.</p></div></div>
+          <p id="file-location" class="project-location"></p>
+          <div id="workspace-files" class="workspace-files" role="tree" aria-label="Workspace files"></div>
+        </section>
       </section>
     </main>
 
     <dialog id="file-viewer" class="file-viewer">
       <header><strong id="file-title"></strong><button id="close-file" class="icon-button small" type="button" aria-label="Close file preview">×</button></header>
-      <div class="file-actions"><button id="show-diff" class="text-button selected" type="button">Diff</button><button id="show-file" class="text-button" type="button">File</button></div>
+      <div id="file-actions" class="file-actions"><button id="show-diff" class="text-button selected" type="button">Diff</button><button id="show-file" class="text-button" type="button">File</button></div>
       <pre id="file-content"></pre>
     </dialog>
-    <script type="module" src="/app.js?v=mobile-ui-3"></script>
+    <dialog id="preview-dialog" class="preview-dialog">
+      <header><strong>Open VM preview</strong><button id="close-preview" class="icon-button small" type="button" aria-label="Close preview">×</button></header>
+      <form id="preview-form">
+        <p>Relay will share only a VM service listening on <code>127.0.0.1</code> with your private Tailnet.</p>
+        <label class="field-label">VM development port <input id="preview-port" type="number" min="1024" max="65535" inputmode="numeric" value="3000" required></label>
+        <p id="preview-status" class="creator-status" role="status"></p>
+        <a id="preview-link" class="primary preview-link" target="_blank" rel="noopener" hidden>Open preview</a>
+        <div class="folder-actions"><button id="stop-preview" class="secondary-action" type="button" disabled>Stop preview</button><button class="primary" type="submit">Create link</button></div>
+      </form>
+    </dialog>
+    <dialog id="composer-menu" class="composer-menu">
+      <header><strong>Add to message</strong><button id="close-composer-menu" class="icon-button small" type="button" aria-label="Close add menu">×</button></header>
+      <div class="composer-menu-actions"><button id="choose-file" type="button"><span aria-hidden="true">↑</span>Add file</button><button id="open-model-settings" type="button"><span aria-hidden="true">⌁</span>Model &amp; effort</button></div>
+    </dialog>
+    <dialog id="model-settings-dialog" class="model-settings-dialog">
+      <header><strong>Next turn</strong><button id="close-model-settings" class="icon-button small" type="button" aria-label="Close model settings">×</button></header>
+      <section id="new-chat-settings" class="new-chat-settings" hidden aria-label="Next turn settings">
+        <label>Model <select id="chat-model"></select></label>
+        <label>Effort <select id="chat-effort"></select></label>
+      </section>
+      <p>These settings apply to your next message.</p>
+    </dialog>
+    <dialog id="workspace-creator" class="workspace-creator">
+      <header><button id="up-folder" class="icon-button small" type="button" aria-label="Up one folder">‹</button><strong id="folder-picker-title">Choose project folder</strong><button id="close-workspace-creator" class="icon-button small" type="button" aria-label="Close folder picker">×</button></header>
+      <section id="folder-browser" class="folder-browser" aria-live="polite">
+        <p id="project-location" class="project-location"></p>
+        <div id="project-directories" class="project-directories" role="tree" aria-label="VM folders"></div>
+        <p class="folder-helper">Choose a folder for Codex.</p>
+        <div class="folder-actions"><button id="show-folder-creator" class="secondary-action" type="button">New folder</button><button id="open-folder" class="primary" type="button">Use this folder</button></div>
+      </section>
+      <form id="folder-creator" class="folder-creator" hidden>
+        <p id="folder-create-location" class="project-location"></p>
+        <p class="folder-helper">This creates a plain folder on your VM.</p>
+        <label class="field-label">Folder name <input id="project-name" maxlength="100" autocomplete="off" required placeholder="personal-portfolio"></label>
+        <div class="folder-actions"><button id="cancel-folder-creator" class="secondary-action" type="button">Cancel</button><button id="create-project" class="primary" type="submit">Create folder</button></div>
+      </form>
+      <p id="project-creator-status" class="creator-status" role="status"></p>
+    </dialog>
+    <script type="module" src="/app.js?v=mobile-reconcile-1"></script>
   </body>
 </html>
