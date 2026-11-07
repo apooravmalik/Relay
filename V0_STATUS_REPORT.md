@@ -1,5 +1,10 @@
 # Relay V0 Status Report
 
+> **Current update, 3 November 2026:** This report records the October V0
+> verification and parts of its roadmap are historical. The private PWA is
+> now implemented in the repository. See [CURRENT_PROGRESS.md](CURRENT_PROGRESS.md)
+> for the current implementation, verification, Linux setup, and next steps.
+
 **As of:** 13 October 2026, Asia/Kolkata
 
 ## Executive summary

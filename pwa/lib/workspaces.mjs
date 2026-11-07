@@ -266,9 +266,8 @@ function statusEntries(statusOutput, untrackedOutput) {
     if (!record) continue;
     const status = record.slice(0, 2);
     if (status === '??') continue;
-    let relativePath = changedPath(record);
+    const relativePath = changedPath(record);
     if ((status.includes('R') || status.includes('C')) && records[index + 1]) {
-      relativePath = records[index + 1];
       index += 1;
     }
     if (relativePath) changes.push({ path: relativePath, status, previewAllowed: !isSensitivePath(relativePath) });
@@ -353,14 +352,18 @@ export async function workspaceChanges(workspacePath) {
   return statusEntries(status, untracked);
 }
 
-async function checkedChangedFile(workspacePath, relativePath) {
+async function checkedChangedPath(workspacePath, relativePath) {
   if (typeof relativePath !== 'string' || !relativePath || path.isAbsolute(relativePath) || relativePath.split(/[\\/]+/).includes('..')) {
     throw new Error('Invalid file path.');
   }
   if (isSensitivePath(relativePath)) throw new Error('Sensitive files are not available in Relay.');
   const changes = await workspaceChanges(workspacePath);
   if (!changes.some((change) => change.path === relativePath && change.previewAllowed)) throw new Error('File is not available for preview.');
-  const canonicalRoot = await realpath(workspacePath);
+  return realpath(workspacePath);
+}
+
+async function checkedChangedFile(workspacePath, relativePath) {
+  const canonicalRoot = await checkedChangedPath(workspacePath, relativePath);
   const candidate = path.resolve(canonicalRoot, relativePath);
   const canonical = await realpath(candidate);
   if (!canonical.startsWith(`${canonicalRoot}${path.sep}`)) throw new Error('Invalid file path.');
@@ -377,9 +380,15 @@ export async function workspaceFile(workspacePath, relativePath) {
 }
 
 export async function workspaceDiff(workspacePath, relativePath) {
-  await checkedChangedFile(workspacePath, relativePath);
-  const output = await gitOrNull(workspacePath, ['diff', '--no-ext-diff', '--unified=3', '--', relativePath]);
-  if (output) return { path: relativePath, diff: output };
+  await checkedChangedPath(workspacePath, relativePath);
+  const [staged, unstaged] = await Promise.all([
+    gitOrNull(workspacePath, ['diff', '--cached', '--no-ext-diff', '--no-textconv', '--unified=3', '--', relativePath]),
+    gitOrNull(workspacePath, ['diff', '--no-ext-diff', '--no-textconv', '--unified=3', '--', relativePath]),
+  ]);
+  if (staged || unstaged) {
+    const diff = [staged && `Staged changes:\n${staged}`, unstaged && `Unstaged changes:\n${unstaged}`].filter(Boolean).join('\n\n');
+    return { path: relativePath, diff };
+  }
   const file = await workspaceFile(workspacePath, relativePath);
   return { path: relativePath, diff: `New file: ${relativePath}\n\n${file.content}` };
 }

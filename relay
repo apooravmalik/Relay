@@ -8,17 +8,25 @@ Usage:
   relay doctor [--vm NAME]
   relay push --project DIR [--vm NAME]
   relay connect --project DIR [--vm NAME]
+  relay workspaces [--vm NAME] [--json]
   relay pull --project DIR [--vm NAME] [--apply] > remote.patch
+  relay pull --workspace WORKSPACE_ID --into DIR [--name NAME] [--vm NAME] --dry-run [--json]
+  relay pull --resume TRANSFER_ID [--vm NAME] [--json]
 
 Without --apply, pull writes the remote delta as a patch. The delta includes
 non-ignored untracked files. --apply checks that the local Git base is
 unchanged and that the patch applies cleanly first.
+Pause independent workspace writers while an import snapshot is captured.
 EOF
 }
 
 die() { printf 'relay: %s\n' "$*" >&2; exit 1; }
 
 require() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi
+}
 
 vm_config() {
   local vm=$1
@@ -62,9 +70,9 @@ scp_to_vm() {
   local vm=$1 source=$2 target=$3
   local config
   if config=$(vm_config "$vm"); then
-    scp -q -F "$config" "$source" "$(vm_host "$vm"):$target"
+    scp -p -q -F "$config" "$source" "$(vm_host "$vm"):$target"
   else
-    scp -q "$source" "$(vm_host "$vm"):$target"
+    scp -p -q "$source" "$(vm_host "$vm"):$target"
   fi
 }
 
@@ -95,6 +103,8 @@ command_doctor() {
   require tar
   printf 'host git: '; git --version
   printf 'host ssh: '; ssh -V 2>&1 | head -1
+  printf 'host python: '; if command -v python3 >/dev/null 2>&1; then python3 --version; else printf 'missing\n'; fi
+  printf 'host rsync: '; if command -v rsync >/dev/null 2>&1; then rsync --version | sed -n '1p'; else printf 'missing\n'; fi
   if vm_config "$vm" >/dev/null; then
     require limactl
     printf 'lima: '; limactl --version
@@ -102,7 +112,7 @@ command_doctor() {
     printf 'remote SSH host: %s\n' "$vm"
   fi
   printf 'vm: '
-  ssh_vm "$vm" 'printf "%s " "$(hostname)"; git --version; tmux -V'
+  ssh_vm "$vm" 'printf "%s " "$(hostname)"; git --version; tmux -V; printf "vm python: "; if command -v python3 >/dev/null 2>&1; then python3 --version; else printf "missing\n"; fi; printf "vm rsync: "; if command -v rsync >/dev/null 2>&1; then rsync --version | head -1; else printf "missing\n"; fi'
 }
 
 command_push() {
@@ -134,14 +144,14 @@ command_push() {
   git -C "$project" diff --binary --full-index --cached HEAD > "$temp/staged.patch"
   git -C "$project" diff --binary --full-index > "$temp/worktree.patch"
   printf 'base=%s\n' "$base" > "$temp/manifest"
-  shasum -a 256 "$temp/staged.patch" | awk '{print "staged_sha256=" $1}' >> "$temp/manifest"
-  shasum -a 256 "$temp/worktree.patch" | awk '{print "worktree_sha256=" $1}' >> "$temp/manifest"
+  sha256_file "$temp/staged.patch" | awk '{print "staged_sha256=" $1}' >> "$temp/manifest"
+  sha256_file "$temp/worktree.patch" | awk '{print "worktree_sha256=" $1}' >> "$temp/manifest"
 
   local -a untracked=()
   local item
   while IFS= read -r -d '' item; do
     untracked+=("$item")
-  done < <(git -C "$project" ls-files --others --exclude-standard -z)
+  done < <(git -C "$project" ls-files --others --exclude='node_modules/' --exclude='.venv/' --exclude='venv/' --exclude='__pycache__/' --exclude='.cache/' -z)
   if ((${#untracked[@]})); then
     COPYFILE_DISABLE=1 tar -C "$project" -cf "$temp/untracked.tar" -- "${untracked[@]}"
   fi
@@ -149,8 +159,9 @@ command_push() {
   local -a payload=(base.bundle manifest staged.patch worktree.patch)
   [[ -f "$temp/untracked.tar" ]] && payload+=(untracked.tar)
   COPYFILE_DISABLE=1 tar -C "$temp" -czf "$archive" "${payload[@]}"
+  chmod 600 "$archive"
   printf 'Uploading %s to %s…\n' "$name" "$vm" >&2
-  ssh_vm "$vm" "mkdir -p \"\$HOME/.relay-v0/incoming\" \"\$HOME/.relay-v0/workspaces\""
+  ssh_vm "$vm" "mkdir -p \"\$HOME/.relay-v0/incoming\" \"\$HOME/.relay-v0/workspaces\"; chmod 700 \"\$HOME/.relay-v0/incoming\""
   scp_to_vm "$vm" "$archive" "$remote_incoming"
 
   ssh_vm "$vm" bash -s -- "$remote_incoming" "$remote_workspace" <<'REMOTE'
@@ -213,6 +224,15 @@ command_connect() {
 }
 
 command_pull() {
+  local arg
+  for arg in "$@"; do
+    case $arg in
+      --workspace|--workspace=*|--resume|--resume=*|--into|--into=*|--name|--name=*|--dry-run|--json)
+        require python3
+        python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/relay_lib/import_workspace.py" "$@"
+        return ;;
+    esac
+  done
   local project= vm=relay-v0 apply=false
   while [[ $# -gt 0 ]]; do
     case $1 in
@@ -271,6 +291,7 @@ case ${1:-} in
   doctor) shift; command_doctor "$@" ;;
   push) shift; command_push "$@" ;;
   connect) shift; command_connect "$@" ;;
+  workspaces) shift; require python3; python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/relay_lib/import_workspace.py" --list "$@" ;;
   pull) shift; command_pull "$@" ;;
   -h|--help|help|'') usage ;;
   *) die "unknown command: $1" ;;

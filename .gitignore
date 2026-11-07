@@ -1,0 +1,11 @@
+# Local workspace imports can contain databases, backups, and secrets.
+/rag-lab-test/
+
+# Python execution artifacts.
+__pycache__/
+*.py[cod]
+
+# Local environment configuration.
+.env
+.env.*
+!.env.example

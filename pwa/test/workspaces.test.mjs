@@ -17,6 +17,8 @@ import {
   saveWorkspaceUpload,
   workspaceFile,
   workspaceBrowseFile,
+  workspaceChanges,
+  workspaceDiff,
 } from '../lib/workspaces.mjs';
 
 const run = promisify(execFile);
@@ -80,6 +82,48 @@ test('workspace change list expands an untracked directory into files', async ()
   const workspace = await inspectWorkspace(root);
   assert.equal(workspace.changedFileCount, 1);
   await assert.doesNotReject(() => workspaceFile(root, 'new-directory/visible.txt'));
+});
+
+test('renamed and staged files show their current name and staged diff', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'relay-rename-test-'));
+  await run('git', ['init', root]);
+  await run('git', ['-C', root, 'config', 'user.email', 'relay-test@example.invalid']);
+  await run('git', ['-C', root, 'config', 'user.name', 'Relay Test']);
+  await writeFile(path.join(root, 'old.txt'), 'before\n');
+  await run('git', ['-C', root, 'add', 'old.txt']);
+  await run('git', ['-C', root, 'commit', '-m', 'base']);
+  await run('git', ['-C', root, 'mv', 'old.txt', 'new.txt']);
+  assert.deepEqual((await workspaceChanges(root)).map((change) => change.path), ['new.txt']);
+  assert.equal((await workspaceFile(root, 'new.txt')).content, 'before\n');
+  assert.match((await workspaceDiff(root, 'new.txt')).diff, /diff --git/);
+});
+
+test('staged and unstaged edits both appear in the diff preview', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'relay-diff-test-'));
+  await run('git', ['init', root]);
+  await run('git', ['-C', root, 'config', 'user.email', 'relay-test@example.invalid']);
+  await run('git', ['-C', root, 'config', 'user.name', 'Relay Test']);
+  await writeFile(path.join(root, 'file.txt'), 'original\n');
+  await run('git', ['-C', root, 'add', 'file.txt']);
+  await run('git', ['-C', root, 'commit', '-m', 'base']);
+  await writeFile(path.join(root, 'file.txt'), 'staged\n');
+  await run('git', ['-C', root, 'add', 'file.txt']);
+  await writeFile(path.join(root, 'file.txt'), 'working\n');
+  const { diff } = await workspaceDiff(root, 'file.txt');
+  assert.match(diff, /-original/);
+  assert.match(diff, /\+working/);
+});
+
+test('a deleted tracked file still has a diff preview', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'relay-deleted-test-'));
+  await run('git', ['init', root]);
+  await run('git', ['-C', root, 'config', 'user.email', 'relay-test@example.invalid']);
+  await run('git', ['-C', root, 'config', 'user.name', 'Relay Test']);
+  await writeFile(path.join(root, 'file.txt'), 'removed line\n');
+  await run('git', ['-C', root, 'add', 'file.txt']);
+  await run('git', ['-C', root, 'commit', '-m', 'base']);
+  await run('git', ['-C', root, 'rm', 'file.txt']);
+  assert.match((await workspaceDiff(root, 'file.txt')).diff, /-removed line/);
 });
 
 test('workspace uploads stay in the workspace and avoid overwriting existing files', async () => {
