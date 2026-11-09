@@ -14,6 +14,7 @@ import unicodedata
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from relay_lib.publication import publish_noreplace
+from relay_lib import update_workspace
 
 HELPER = (Path(__file__).resolve().parent / 'export_workspace.py').read_text()
 
@@ -37,9 +38,9 @@ def ssh_command(vm):
     return ssh, host
 
 
-def remote(ssh, host, workspace, action):
+def remote(ssh, host, workspace, action, request=None):
     command = 'python3 -c ' + shlex.quote(HELPER) + ' ' + shlex.quote(workspace) + ' ' + action
-    result = subprocess.run([*ssh, host, command], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result = subprocess.run([*ssh, host, command], stdout=subprocess.PIPE, stderr=subprocess.PIPE, input=json.dumps(request).encode() if request is not None else None)
     try: data = json.loads(result.stdout)
     except ValueError: raise ValueError('Could not obtain a response over SSH; check connectivity and remote Python and Git.')
     if result.returncode or 'error' in data: raise ValueError(data.get('error', 'remote_error') + ': ' + data.get('message', 'Remote operation failed.'))
@@ -149,17 +150,24 @@ def write_json_atomic(path, data):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try: os.fsync(directory_fd)
+        finally: os.close(directory_fd)
     finally:
         if os.path.exists(temporary): os.unlink(temporary)
 
 
-def verify_project(project, manifest):
+def verify_project(project, manifest, ignore_paths=()):
+    ignored = set(ignore_paths)
     expected = {entry['path']: entry for entry in manifest['entries']}
     actual = set()
     for current, dirs, files in os.walk(project, followlinks=False):
         if Path(current) == project and manifest['git']['mode'] != 'plain' and '.git' in dirs:
             if (project / '.git').is_symlink(): raise ValueError('Invalid Git metadata directory.')
             dirs.remove('.git')
+        for name in list(dirs):
+            rel = (Path(current) / name).relative_to(project).as_posix()
+            if rel in ignored: dirs.remove(name)
         for name in dirs + files:
             path = Path(current) / name
             rel = path.relative_to(project).as_posix()
@@ -220,6 +228,13 @@ def complete_transfer(args, state, state_file):
     payload = staging / 'payload'
     destination = Path(state['destination'])
     receipt = {'schema_version': 1, 'transfer_id': transfer, 'workspace_id': manifest['workspace_id'], 'vm': args.vm, 'destination': str(destination), 'head': manifest['git']['head'], 'exclusions': manifest['exclusions'], 'manifest_sha256': digest(payload / 'manifest.json')}
+    update_workspace.pair_import(state, write_json_atomic)
+    pair = json.loads(update_workspace.pairing_path(destination).read_text())
+    acknowledged = update_workspace.remote_cp(sys.modules[__name__], state['vm'], pair, 'init', update_workspace.cp(pair))
+    if acknowledged['checkpoint'] != update_workspace.cp(pair) or acknowledged['pending'] is not None:
+        raise ValueError('RECOVERY_REQUIRED: initial checkpoint acknowledgment differs.')
+    pair['acknowledgment'] = 'acknowledged'
+    write_json_atomic(update_workspace.pairing_path(destination), pair)
     receipt_file = state_file.parent / (transfer + '.json')
     write_json_atomic(receipt_file, receipt)
     state_file.unlink()
@@ -230,8 +245,21 @@ def complete_transfer(args, state, state_file):
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='relay pull')
     parser.add_argument('--workspace'); parser.add_argument('--into'); parser.add_argument('--name'); parser.add_argument('--resume')
+    parser.add_argument('--update', action='store_true'); parser.add_argument('--resume-update'); parser.add_argument('--inspect-update'); parser.add_argument('--abort-update')
     parser.add_argument('--vm', default='relay-v0'); parser.add_argument('--dry-run', action='store_true'); parser.add_argument('--json', action='store_true'); parser.add_argument('--list', action='store_true')
     args = parser.parse_args(argv)
+    if args.inspect_update or args.abort_update:
+        if sum(bool(x) for x in (args.inspect_update, args.abort_update, args.resume_update, args.workspace, args.into, args.name, args.resume, args.update, args.dry_run, args.list)) != 1: parser.error('inspect/abort cannot be combined with other transfer options')
+        try: return update_workspace.manage(args, sys.modules[__name__])
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc: return fail(args, 'update_failed', str(exc))
+    if args.resume_update:
+        if args.workspace or args.into or args.name or args.resume or args.update or args.dry_run or args.list: parser.error('--resume-update cannot be combined with other transfer options')
+        try: return update_workspace.resume(args, sys.modules[__name__])
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc: return fail(args, 'update_failed', str(exc))
+    if args.update:
+        if not args.workspace or not args.into or args.name or args.resume or args.list: parser.error('--update requires --workspace and --into DESTINATION')
+        try: return update_workspace.run(args, sys.modules[__name__])
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc: return fail(args, 'update_failed', str(exc))
     if args.list:
         if args.workspace or args.into or args.name or args.resume or args.dry_run: parser.error('--list cannot be combined with import options')
         try:

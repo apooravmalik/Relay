@@ -9,3 +9,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+
+# Relay staging and retained recovery copies may contain secrets and databases.
+.relay-update-*/
+.relay-import-*/

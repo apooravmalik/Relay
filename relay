@@ -7,10 +7,16 @@ usage() {
 Usage:
   relay doctor [--vm NAME]
   relay push --project DIR [--vm NAME]
+  relay push --workspace WORKSPACE_ID --project DIR [--file RELATIVE_PATH] --dry-run [--vm NAME] [--json]
+  relay push --workspace WORKSPACE_ID --project DIR [--file RELATIVE_PATH] [--resume] [--vm NAME] [--json]
   relay connect --project DIR [--vm NAME]
   relay workspaces [--vm NAME] [--json]
   relay pull --project DIR [--vm NAME] [--apply] > remote.patch
   relay pull --workspace WORKSPACE_ID --into DIR [--name NAME] [--vm NAME] --dry-run [--json]
+  relay pull --workspace WORKSPACE_ID --into DESTINATION --update [--dry-run] [--vm NAME] [--json]
+  relay pull --inspect-update DESTINATION [--vm NAME] [--json]
+  relay pull --abort-update DESTINATION [--vm NAME] [--json]
+  relay pull --resume-update DESTINATION [--vm NAME] [--json]
   relay pull --resume TRANSFER_ID [--vm NAME] [--json]
 
 Without --apply, pull writes the remote delta as a patch. The delta includes
@@ -116,6 +122,15 @@ command_doctor() {
 }
 
 command_push() {
+  local arg
+  for arg in "$@"; do
+    case $arg in
+      --workspace|--workspace=*)
+        require python3
+        python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/relay_lib/plain_push.py" "$@"
+        return ;;
+    esac
+  done
   local project= vm=relay-v0
   while [[ $# -gt 0 ]]; do
     case $1 in
@@ -227,7 +242,7 @@ command_pull() {
   local arg
   for arg in "$@"; do
     case $arg in
-      --workspace|--workspace=*|--resume|--resume=*|--into|--into=*|--name|--name=*|--dry-run|--json)
+      --workspace|--workspace=*|--update|--inspect-update|--inspect-update=*|--abort-update|--abort-update=*|--resume-update|--resume-update=*|--resume|--resume=*|--into|--into=*|--name|--name=*|--dry-run|--json)
         require python3
         python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/relay_lib/import_workspace.py" "$@"
         return ;;

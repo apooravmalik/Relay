@@ -24,6 +24,17 @@ class MonitorTests(unittest.TestCase):
                 monitor_rag.record({}, state)
                 self.assertIn('Monitor recovery — rag_app', log.read_text())
 
+    def test_logs_each_sample_privately_at_two_minute_interval(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / 'samples.jsonl'
+            monitor_rag.record_sample(log, 'first', {})
+            monitor_rag.record_sample(log, 'second', {'connection': 'Offline.'})
+            samples = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertEqual([sample['time_utc'] for sample in samples], ['first', 'second'])
+            self.assertEqual(samples[1]['issues'], {'connection': 'Offline.'})
+            self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(monitor_rag.INTERVAL_SECONDS, 120)
+
     def test_health_checks_distinguish_unavailable_containers(self):
         response = {'pwa': 'active', 'app': 200, 'qdrant': 200, 'containers': {'rag-lab-app-1': 'running healthy', 'rag-lab-qdrant-1': 'running'}}
         with patch.object(monitor_rag.subprocess, 'run') as run:

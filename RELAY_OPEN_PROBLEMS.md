@@ -1,6 +1,6 @@
 # Relay — Open Problems and Validation Backlog
 
-**Last reviewed:** 20 October 2026
+**Last reviewed:** 10 November 2026
 
 This is the working list of problems found while testing the Mac → VM → phone
 workflow. A problem is closed only after it has reproducible test evidence; a
@@ -29,10 +29,9 @@ must not receive general SSH/shell access to it.
 has changed locally. A direct VM-to-Mac SSH design would expose the personal
 Mac to the VM and to prompt-controlled agent actions.
 
-**Required fix:** install a Mac Relay Agent as a `launchd` service. It makes an
-outbound authenticated Tailnet connection, polls only signed jobs referencing
-registered workspace IDs, and executes the local transfer. The PWA must show
-`Mac offline`, `queued`, `transferring`, `verified`, `conflict`, or `failed`.
+**Current direction:** keep transfers human-initiated from the local CLI. A
+phone-requested Mac transfer is not part of V1.3 and must not require a Mac
+background agent or grant the VM arbitrary access to the Mac.
 
 ### RLY-002 · No durable writable-owner state prevents concurrent editing
 
@@ -49,27 +48,32 @@ push or pull may require a merge; it must never silently overwrite either side.
 hash, handoff timestamp, and owner. Only a hash-verified handoff changes owner.
 Conflicts leave both copies untouched and visible to the user.
 
-### RLY-003 · VM-only non-Git workspaces are not yet a first-class CLI pull
+### RLY-003 · First-import safety and cross-platform validation remain incomplete
 
-**Status:** Partially proven
+**Status:** First import implemented; hardening and platform validation open
 
-Git delta pull works. A complete non-Git workspace export from the VM to a new
-Mac folder has been proven manually, but `relay pull` does not yet provide this
-as a transactional product command.
+`relay pull --workspace ID --into DIR` imports a registered VM-created plain or
+supported Git workspace into a new PC folder using staging, a manifest, hash
+checks and a no-replace publication. A real plain RAG workspace and Qdrant
+snapshot were imported and tested on Linux. Git edge cases are covered by
+automated tests and a committed-Git VM import was exercised. The capture still
+requires paused writers and has not been validated as an atomic filesystem
+snapshot or on native macOS/Windows.
 
 **Failure path:** copying into an existing local folder could mix or overwrite
 unrelated files. A partial network transfer could be mistaken for a complete
 workspace.
 
-**Required fix:** add an explicit `relay pull --workspace-export --destination
-PATH` mode. It must require a new/empty destination, transfer a manifest with
-path/size/SHA-256, verify it, and never infer a merge or delete local files.
+**Remaining work:** strengthen writer coordination, space/resource limits,
+export retention, filesystem-race handling and platform coverage. Keep the
+requirement that the destination path is absent, including an empty directory.
 
 ### RLY-004 · Push conflict semantics need a formal preflight
 
 **Status:** Partially proven
 
-`relay push` can capture Git state, patches, and non-ignored untracked files.
+`relay push` can capture Git state, patches, and untracked files including
+Git-ignored files, apart from excluded dependency/cache directories.
 The system still needs an explicit remote-handoff preflight when the VM has
 changed since the last synchronized snapshot.
 
@@ -84,10 +88,11 @@ three-way merge workflow.
 
 **Status:** Current limitation
 
-Relay records a shared checkpoint and transfers file-tree deltas; it does not
-automatically merge two independently created Git commits. If the Mac and VM
-both advance from the same checkpoint, Relay refuses the next unsafe push or
-pull rather than overwrite either copy.
+The legacy handoff records a checkpoint and transfers file-tree deltas; it does
+not automatically merge two independently created Git commits. First import
+restores the VM's captured HEAD into a separate new directory. The legacy
+pull checks the local base, but this is not a complete divergence-resolution
+protocol for both histories.
 
 **Failure path:** a developer commits Mac work, Codex commits VM work, and the
 two histories become sibling commits. A normal Git merge may require a
@@ -98,22 +103,20 @@ both snapshots, presents per-file/base-Mac-VM diffs, allows a user to resolve
 conflicts, verifies the resolved tree, and only then writes a new shared Relay
 checkpoint. Do not silently merge, rebase, or advance a checkpoint.
 
-### RLY-012 · `relay push` is currently first-handoff only
+### RLY-012 · Repeat handoff support is incomplete
 
-**Status:** Current limitation
+**Status:** Plain-folder multi-file round trip exercised; Git repeat sync open
 
-The prototype refuses a push when the target VM workspace already exists. This
-protects existing VM work, but it also means the intended repeatable loop —
-Mac changes → `relay push` → same VM workspace — is not yet implemented.
+A destination-specific, journaled plain-folder push and repeat pull completed a
+RAG workspace cycle. Git repeat push/pull, automatic conflict resolution and
+broader platform verification remain unsupported. Legacy first-handoff Git push
+still refuses an existing target.
 
-**Failure path:** deleting or replacing the existing VM folder to force another
-push could discard phone/Codex changes. Treating the folder as an unconditional
-restore target would have the same risk in reverse.
+**Failure path:** treating an existing VM workspace as an unconditional restore
+target could discard phone or local work.
 
-**Required fix:** turn push into a snapshot-based update. It must first compare
-the VM's recorded handoff snapshot to its current manifest, then either stage
-and verify the new Mac snapshot, reject a conflict, or offer an explicit merge
-flow. No automatic deletion of an existing workspace.
+**Remaining work:** extend only verified, conflict-aware flows; preserve both
+versions and advance checkpoints only after verified acknowledgment.
 
 ### RLY-013 · Relay is not yet installable with `npx`
 
@@ -131,6 +134,91 @@ and trust boundaries unclear.
 portable binary, explicit `bin` command, versioned release artifact,
 configuration/bootstrap flow, and a separate secure VM enrollment step. Keep
 the transfer protocol independent of npm so non-Node users are not excluded.
+
+### RLY-015 · Multi-file publication is not atomic across the whole workspace
+
+**Status:** Open — recoverable, not atomically visible
+
+A batch push journals and publishes files individually. A crash or concurrent
+reader may observe a partially updated tree until the transfer is resumed;
+prior versions are retained for recovery and a checkpoint is not acknowledged
+until verification. This is not a single atomic workspace transaction.
+
+**Remaining work:** test interruption at every publication boundary, provide
+clear inspect/resume and safe rollback where possible, and prevent readers and
+writers from treating a partially published workspace as complete.
+
+### RLY-016 · External writers cannot be reliably locked out
+
+**Status:** Open — writers must be paused
+
+Relay locks coordinate Relay transfers. The VM open-file check is advisory and
+cannot prevent an editor, database, or a process holding an old file descriptor
+from writing during or after verification.
+
+**Remaining work:** establish and test a practical writer-quiescence protocol;
+continue to detect divergence, preserve recovery copies, and refuse when safety
+cannot be established. Do not claim checksums alone prevent concurrent writes.
+
+### RLY-017 · Repeat pull transfers the entire captured workspace
+
+**Status:** Open — performance and storage
+
+The observed RAG return pull transferred roughly 550 MB even though only three
+small files changed. Captures, hashing and recovery copies can consume time and
+disk proportional to the full workspace.
+
+**Remaining work:** design and validate incremental, resumable transfers and
+explicit free-space checks without weakening the full-manifest validation or
+excluding required ignored data.
+
+### RLY-018 · Transfer and recovery artifacts need retention and encryption
+
+**Status:** Open
+
+VM exports, push recovery copies, and local retained directories may contain
+`.env`, application data and credentials. Current private permissions are not
+encryption, and artifacts are not automatically expired or quota-limited.
+
+**Remaining work:** protect durable artifacts, add bounded retention and safe
+cleanup, preserve the last necessary recovery point, and test disk-full paths.
+Do not silently exclude project runtime files.
+
+### RLY-019 · File types, cross-filesystem and Git repeat support are limited
+
+**Status:** Open
+
+The paired batch path supports plain workspaces with regular files and supported
+directories. Git repeat sync, symlinks, special files, file/directory type
+transitions and cross-filesystem VM publication remain unsupported and must
+fail explicitly. Local excluded directories are preserved on pull only when
+they contain supported types.
+
+**Remaining work:** prioritize and validate additional types and Git index
+fidelity; retain safe refusal for the rest.
+
+### RLY-020 · Release-level recovery and platform validation is incomplete
+
+**Status:** Open
+
+Local fixtures and an isolated temporary workspace on the existing VM exercised
+multi-file push, interruption recovery, a synthetic `.env`, an 11 MiB file and
+repeat pull. One real RAG cycle completed. This does not establish exhaustive
+crash coverage, an independent disposable-VM test or native macOS correctness.
+
+**Remaining work:** test every transaction boundary, concurrent writers, disk
+exhaustion and native macOS/Linux behavior on separate disposable systems.
+
+### RLY-021 · Live database consistency is not guaranteed by file hashes
+
+**Status:** Open
+
+A byte-for-byte copy of a running database may not be logically consistent.
+The RAG round trip did not test a live database; Qdrant and the app were stopped.
+
+**Remaining work:** validate Qdrant snapshot/restore and PostgreSQL consistent
+export/restore, record versions, and refuse or clearly label unsupported raw
+live database captures.
 
 ## P1 — Phone and PWA reliability
 
@@ -188,9 +276,10 @@ version cannot change them safely.
 
 **Status:** Current limitation
 
-V0 transfers source state. Node/Python dependencies, Docker images, databases,
-volumes, background services, and local tool versions are not yet captured as
-portable, validated environment state.
+First import transfers selected workspace files, including database files and
+backups, and one Qdrant snapshot was restored on the PC. Dependencies, Docker
+images, external volumes, database services and local tool versions are not
+automatically captured or recreated as portable, validated environment state.
 
 **Failure path:** the VM receives the files but a build, Playwright workflow,
 or local database-backed application does not run the same way as it did on the
@@ -201,20 +290,21 @@ versions, devcontainer/Docker configuration, selected service snapshots) and
 rebuild dependencies on the VM. Treat architecture-specific artifacts such as
 `node_modules` as disposable caches, not portable source state.
 
-### RLY-009 · Secrets require explicit references, not accidental file transfer
+### RLY-009 · Deliberate secret transfer needs lifecycle and retention controls
 
 **Status:** Current limitation
 
-Ignored files such as `.env` are intentionally excluded, but a non-ignored
-secret can still be transferred with ordinary untracked files. There is no
-secret-reference model yet.
+The current user-selected policy deliberately transfers `.env`, keys and
+Git-ignored project files. VM exports can retain those files indefinitely;
+there is no secret-reference model, automatic redaction or export expiry yet.
 
-**Failure path:** a developer commits or leaves a credential unignored and
-Relay copies it to the VM, a manifest, or future audit data.
+**Failure path:** a workspace or retained export contains credentials and is
+copied, retained, or shared beyond the intended machines or users.
 
-**Required fix:** add preflight secret scanning/warnings and a later
-user-controlled secret-reference mechanism. Do not log secret values, and do
-not treat `.gitignore` as the sole production security boundary.
+**Required fix:** make inclusion and retention visible and controllable, add
+secure cleanup and optional secret-reference workflows, and avoid logging
+secret values. Do not use `.gitignore` as the transfer policy. See
+[workspace data policy](VM_WORKSPACE_DATA_POLICY.md).
 
 ## P2 — Operating the service beyond one user
 
@@ -253,16 +343,14 @@ resource quotas, and immediate revocation.
 
 ## Verification queue
 
-1. Build the Mac Relay Agent and signed job queue; prove offline, expired,
-   duplicate, and successful jobs.
-2. Add transactional non-Git workspace export and test interrupted transfer,
-   target-not-empty, hash mismatch, and retry.
-3. Add ownership/preflight checks and test simultaneous Mac/VM edits.
-4. Make preview readiness observable and test delayed startup, wrong port,
-   public listener rejection, and shutdown.
-5. Capture environment manifests for one Node + Python + Playwright project;
-   prove a clean VM rebuild.
-6. Finish Firecracker P2 isolation before any external beta access.
+1. Exercise crash and retry boundaries for both endpoints on a separate
+   disposable VM and on native macOS and Linux.
+2. Validate multi-file publication, local exclusions, conflicting edits,
+   disk-full behavior and external-writer coordination.
+3. Reduce repeat-pull transfer volume without weakening verification.
+4. Add artifact encryption, quotas and safe retention/cleanup.
+5. Validate Qdrant and PostgreSQL application-consistent backup and restore.
+6. Verify private preview readiness and keep multi-tenant isolation separate.
 
 ## Closed / do not re-open without a new reproduction
 
