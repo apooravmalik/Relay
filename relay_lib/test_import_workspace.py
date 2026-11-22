@@ -44,6 +44,55 @@ class ImportPreviewTests(unittest.TestCase):
     def run_push(self, project, path, *extra):
         return subprocess.run([str(RELAY), 'push', '--workspace', self.workspace_id, '--project', str(project), '--file', path, '--json', *extra], env=self.env, capture_output=True, text=True)
 
+    def test_plain_policy_import_and_update_preserve_excluded_file(self):
+        (self.source / '.relayignore').write_text('exclude secret\n')
+        (self.source / 'secret').write_text('VM secret')
+        (self.source / 'file').write_text('initial')
+        options = ('--workspace', self.workspace_id, '--into', str(self.dest), '--json')
+        result = self.run_relay(*options, '--dry-run')
+        self.assertEqual(json.loads(result.stdout)['policy_dispositions']['secret'], 'exclude')
+        result = self.run_relay(*options)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        project = self.dest / 'source'
+        self.assertFalse((project / 'secret').exists())
+        (project / 'secret').write_text('PC secret')
+        (self.source / 'file').write_text('phone edit')
+        result = self.run_relay('--workspace', self.workspace_id, '--into', str(project), '--update', '--json')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((project / 'file').read_text(), 'phone edit')
+        self.assertEqual((project / 'secret').read_text(), 'PC secret')
+        (self.source / '.relayignore').write_text('exclude file\n')
+        preview = self.run_relay('--workspace', self.workspace_id, '--into', str(project), '--update',
+                                 '--dry-run', '--json')
+        self.assertEqual(json.loads(preview.stdout)['status'], 'BLOCKED')
+        blocked = self.run_relay('--workspace', self.workspace_id, '--into', str(project), '--update', '--json')
+        self.assertIn('POLICY_MISMATCH', blocked.stdout)
+        self.assertEqual((project / 'file').read_text(), 'phone edit')
+
+    def test_git_policy_refuses_excluded_history_and_stale_resume(self):
+        git = lambda *args: subprocess.check_output(['git', '-C', str(self.source), *args])
+        git('init', '-q')
+        (self.source / 'archive').write_text('older content')
+        git('add', 'archive')
+        git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'archive')
+        git('rm', 'archive')
+        git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'remove archive')
+        policy = self.source / '.relayignore'
+        policy.write_text('exclude archive\n')
+        options = ('--workspace', self.workspace_id, '--into', str(self.dest), '--json')
+        result = self.run_relay(*options)
+        self.assertEqual(json.loads(result.stdout)['error'], 'excluded_tracked_file')
+        policy.write_text('protect archive\n')
+        self.env['RELAY_TEST_INTERRUPT'] = '1'
+        result = self.run_relay(*options)
+        self.assertIn('Transfer interrupted', result.stdout)
+        transfer = next((self.base / '.relay-v0' / 'imports').glob('*.pending.json')).name.split('.')[0]
+        del self.env['RELAY_TEST_INTERRUPT']
+        policy.write_text('exclude archive\n')
+        result = self.run_relay('--resume', transfer, '--json')
+        self.assertIn('policy_mismatch', result.stdout)
+        self.assertFalse((self.dest / 'source').exists())
+
     def test_plain_single_file_push_preserves_runtime_and_repeat_pull(self):
         (self.source / '.env').write_text('TOKEN=secret')
         (self.source / 'file').write_text('old')
@@ -512,8 +561,210 @@ class ImportPreviewTests(unittest.TestCase):
         self.assertEqual(self.run_relay('--workspace', self.workspace_id, '--into', str(self.dest), '--json').returncode, 0)
         git_project = self.dest / 'source'
         result = self.run_relay('--workspace', self.workspace_id, '--into', str(git_project), '--update', '--json')
-        self.assertIn('UNSUPPORTED', result.stdout)
+        self.assertEqual(json.loads(result.stdout)['status'], 'NO_OP')
         self.assertTrue((git_project / '.git').is_dir())
+
+    def test_git_handoff_previews_report_index_and_file_changes_without_writing(self):
+        subprocess.run(['git', 'init', '-q', str(self.source)], check=True)
+        (self.source / 'file').write_text('initial')
+        subprocess.run(['git', '-C', str(self.source), 'add', 'file'], check=True)
+        result = self.run_relay('--workspace', self.workspace_id, '--into', str(self.dest), '--json')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        project = self.dest / 'source'
+        (project / 'file').write_text('staged')
+        subprocess.run(['git', '-C', str(project), 'add', 'file'], check=True)
+        (project / 'file').write_text('working')
+        before_index = subprocess.check_output(['git', '-C', str(project), 'ls-files', '--stage'])
+        pull = self.run_relay('--workspace', self.workspace_id, '--into', str(project), '--update', '--dry-run', '--json')
+        self.assertEqual(pull.returncode, 0, pull.stdout + pull.stderr)
+        push = subprocess.run([str(RELAY), 'push', '--workspace', self.workspace_id, '--project', str(project), '--dry-run', '--json'], env=self.env, capture_output=True, text=True)
+        self.assertEqual(push.returncode, 0, push.stdout + push.stderr)
+        for result, supported in ((pull, False), (push, True)):
+            data = json.loads(result.stdout)
+            self.assertEqual(data['local_changes'], {'file': 'modified'})
+            self.assertTrue(data['local_git_changed'])
+            self.assertFalse(data['cloud_git_changed'])
+            self.assertEqual(data['transfer_supported'], supported)
+            self.assertEqual(data['local_git_state']['index_changes'], {'file': 'modified'})
+            self.assertEqual(data['cloud_git_state']['index_changes'], {})
+            self.assertFalse(data['local_git_state']['head_changed'])
+            self.assertNotIn('"working"', result.stdout)
+        self.assertEqual((project / 'file').read_text(), 'working')
+        self.assertEqual(subprocess.check_output(['git', '-C', str(project), 'ls-files', '--stage']), before_index)
+        self.assertEqual((self.source / 'file').read_text(), 'initial')
+
+    def test_git_round_trips_policy_and_existing_commit(self):
+        def git(path, *args):
+            return subprocess.check_output(['git', '-C', str(path), *args]).strip()
+        git(self.source, 'init', '-q')
+        git(self.source, 'config', 'user.name', 'Test')
+        git(self.source, 'config', 'user.email', 'test@example.com')
+        (self.source / 'file').write_text('base')
+        (self.source / 'deleted').write_text('base deleted')
+        git(self.source, 'add', 'file', 'deleted')
+        git(self.source, 'commit', '-qm', 'base')
+        head = git(self.source, 'rev-parse', 'HEAD')
+        (self.source / '.relayignore').write_text('protect .env\nexclude local-only.db\n')
+        (self.source / '.env').write_bytes(b'TOKEN=synthetic\0')
+        (self.source / 'local-only.db').write_text('vm only')
+        imported = self.run_relay('--workspace', self.workspace_id, '--into', str(self.dest), '--json')
+        self.assertEqual(imported.returncode, 0, imported.stdout + imported.stderr)
+        project = self.dest / 'source'
+        self.assertEqual((project / '.env').read_bytes(), b'TOKEN=synthetic\0')
+        self.assertFalse((project / 'local-only.db').exists())
+        (project / 'local-only.db').write_text('pc only')
+        git(project, 'remote', 'add', 'keep', 'https://example.invalid/keep')
+        git(self.source, 'branch', 'unchanged')
+        push = [str(RELAY), 'push', '--workspace', self.workspace_id, '--project', str(project), '--json']
+        pull = ('--workspace', self.workspace_id, '--into', str(project), '--update', '--json')
+
+        def check(result):
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn('TOKEN=', result.stdout + result.stderr)
+            return json.loads(result.stdout)
+
+        def assert_equal_state():
+            for command in (('status', '--short'), ('diff', '--binary'), ('diff', '--cached', '--binary')):
+                # Excluded files can appear in status with separate local values.
+                self.assertEqual(git(project, *command), git(self.source, *command))
+
+        for cycle in range(2):
+            (project / 'file').write_text(f'index {cycle}')
+            git(project, 'add', 'file')
+            (project / 'file').write_text(f'working {cycle}')
+            if cycle == 0:
+                git(project, 'rm', 'deleted')
+                (project / 'deleted').write_text('recreated only in worktree')
+                (project / 'large.bin').write_bytes(b'z' * (11 * 1024 * 1024))
+            result = check(subprocess.run(push, env=self.env, capture_output=True, text=True))
+            self.assertEqual(git(self.source, 'show', ':file'), f'index {cycle}'.encode())
+            self.assertEqual((self.source / 'file').read_text(), f'working {cycle}')
+            self.assertFalse(git(self.source, 'ls-files', 'deleted'))
+            assert_equal_state()
+            self.assertEqual(check(subprocess.run([*push, '--resume'], env=self.env, capture_output=True, text=True))['transfer_id'], result['transfer_id'])
+            (self.source / 'phone.txt').write_text(f'VM {cycle}')
+            git(self.source, 'add', 'phone.txt')
+            (self.source / 'phone.txt').write_text(f'VM working {cycle}')
+            received = check(self.run_relay(*pull))
+            self.assertEqual(received['parent_id'], result['transfer_id'])
+            assert_equal_state()
+            self.assertEqual(git(project, 'rev-parse', 'HEAD'), head)
+            self.assertEqual(git(self.source, 'rev-parse', 'HEAD'), head)
+        self.assertEqual((project / 'local-only.db').read_text(), 'pc only')
+        self.assertEqual((self.source / 'local-only.db').read_text(), 'vm only')
+        self.assertEqual(git(project, 'remote'), b'keep')
+        self.assertEqual(git(self.source, 'rev-parse', 'unchanged'), head)
+
+        git(project, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'approved staged state')
+        selected = git(project, 'rev-parse', 'HEAD').decode()
+        refused = subprocess.run(push, env=self.env, capture_output=True, text=True)
+        self.assertIn('COMMIT_APPROVAL_REQUIRED', refused.stdout)
+        check(subprocess.run([*push, '--commit', selected], env=self.env, capture_output=True, text=True))
+        self.assertEqual(git(self.source, 'rev-parse', 'HEAD').decode(), selected)
+        assert_equal_state()
+
+    def test_git_recovery_and_scoped_merge_approval(self):
+        git = lambda *args: subprocess.check_output(['git', '-C', str(self.source), *args])
+        git('init', '-q')
+        (self.source / 'text.txt').write_text('shared\n')
+        (self.source / 'personal.txt').write_text('PRIVATE_BASE\n')
+        (self.source / '.relayignore').write_text('protect personal.txt\n')
+        self.assertEqual(self.run_relay('--workspace', self.workspace_id, '--into', str(self.dest)).returncode, 0)
+        project = self.dest / 'source'
+        key = ['--workspace', self.workspace_id, '--project', str(project), '--json']
+
+        def cli(command, *options, expected=0):
+            result = subprocess.run([str(RELAY), command, *key, *options], env=self.env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+            self.assertNotIn('PRIVATE_', result.stdout)
+            return json.loads(result.stdout)
+
+        (project / 'text.txt').write_text('after interrupted upload\n')
+        self.env['RELAY_TEST_INTERRUPT'] = '1'
+        self.assertIn('FAILED_RECOVERABLE', cli('push', expected=1)['message'])
+        self.assertEqual((self.source / 'text.txt').read_text(), 'shared\n')
+        del self.env['RELAY_TEST_INTERRUPT']
+        push = cli('push', '--resume')
+        self.assertEqual(cli('push', '--resume')['transfer_id'], push['transfer_id'])
+        (self.source / 'text.txt').write_text('after interrupted download\n')
+        self.env['RELAY_TEST_INTERRUPT'] = '1'
+        failed = self.run_relay('--workspace', self.workspace_id, '--into', str(project), '--update', '--json')
+        self.assertIn('FAILED_RECOVERABLE', failed.stdout)
+        self.assertEqual((project / 'text.txt').read_text(), 'after interrupted upload\n')
+        del self.env['RELAY_TEST_INTERRUPT']
+        pull = self.run_relay('--resume-update', str(project), '--json')
+        self.assertEqual(pull.returncode, 0, pull.stdout + pull.stderr)
+        self.assertEqual(json.loads(pull.stdout)['parent_id'], push['transfer_id'])
+
+        (project / 'text.txt').write_text('PC wants this\n')
+        (self.source / 'text.txt').write_text('VM wants this\n')
+        (project / 'personal.txt').write_text('PRIVATE_PC\n')
+        (self.source / 'personal.txt').write_text('PRIVATE_VM\n')
+        review = cli('merge')
+        plan_id = review['plan_id']
+        self.assertEqual(review['status'], 'CONFLICT')
+        self.assertEqual([entry['key'] for entry in review['conflicts']],
+                         ['worktree:personal.txt', 'worktree:text.txt'])
+        provider = self.base / 'provider'
+        received = self.base / 'provider-input.json'
+        provider.write_text('#!/usr/bin/env python3\nimport pathlib,sys\npathlib.Path(' +
+                            repr(str(received)) + ').write_bytes(sys.stdin.buffer.read())\nprint("approved draft")\n')
+        provider.chmod(0o700)
+        cli('merge', '--assist', plan_id, '--select', 'worktree:personal.txt', '--provider', str(provider),
+            '--approve-request', expected=1)
+        self.assertFalse(received.exists())
+        request = cli('merge', '--assist', plan_id, '--select', 'worktree:text.txt')
+        self.assertEqual(request['status'], 'REQUEST_REVIEW')
+        self.assertFalse(received.exists())
+        cli('merge', '--assist', plan_id, '--select', 'worktree:text.txt', '--provider', str(provider),
+            '--approve-request')
+        payload = json.loads(received.read_text())
+        self.assertNotIn('PRIVATE_', received.read_text())
+        self.assertEqual(payload['versions']['pc'], 'PC wants this\n')
+        self.assertEqual((project / 'text.txt').read_text(), 'PC wants this\n')
+        self.assertEqual((self.source / 'text.txt').read_text(), 'VM wants this\n')
+        cli('merge', '--approve', plan_id, '--resolve', 'worktree:text.txt=proposal',
+            '--resolve', 'worktree:personal.txt=vm')
+        self.assertEqual((project / 'text.txt').read_text(), 'approved draft\n')
+        self.assertEqual((self.source / 'text.txt').read_text(), 'approved draft\n')
+        self.assertEqual((project / 'personal.txt').read_text(), 'PRIVATE_VM\n')
+
+    def test_divergent_git_history_requires_reviewed_descendant(self):
+        def git(path, *args):
+            return subprocess.check_output(['git', '-C', str(path), *args], stderr=subprocess.PIPE).decode().strip()
+        def commit(path, filename, value):
+            (path / filename).write_text(value)
+            git(path, 'add', filename)
+            git(path, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', filename)
+            return git(path, 'rev-parse', 'HEAD')
+        git(self.source, 'init', '-q')
+        base = commit(self.source, 'base.txt', 'base')
+        imported = self.run_relay('--workspace', self.workspace_id, '--into', str(self.dest), '--json')
+        self.assertEqual(imported.returncode, 0, imported.stdout + imported.stderr)
+        project = self.dest / 'source'
+        pc = commit(project, 'pc.txt', 'desktop commit')
+        vm = commit(self.source, 'vm.txt', 'phone commit')
+        self.assertNotEqual(vm, pc)
+        args = [str(RELAY), 'merge', '--workspace', self.workspace_id, '--project', str(project), '--json']
+        plan = subprocess.run(args, env=self.env, capture_output=True, text=True)
+        self.assertEqual(plan.returncode, 0, plan.stdout + plan.stderr)
+        review = json.loads(plan.stdout)
+        self.assertEqual(review['status'], 'HISTORY_REVIEW_REQUIRED')
+        self.assertEqual(git(project, 'rev-parse', 'HEAD'), pc)
+        self.assertEqual(git(self.source, 'rev-parse', 'HEAD'), vm)
+        review_repo = Path(review['history_repository'])
+        git(review_repo, 'switch', 'pc')
+        git(review_repo, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+            'merge', '--no-ff', '-m', 'reviewed merge', 'vm')
+        merged = git(review_repo, 'rev-parse', 'HEAD')
+        approve = subprocess.run([*args, '--approve', review['plan_id'], '--commit', merged],
+                                 env=self.env, capture_output=True, text=True)
+        self.assertEqual(approve.returncode, 0, approve.stdout + approve.stderr)
+        for endpoint in (project, self.source):
+            self.assertEqual(git(endpoint, 'rev-parse', 'HEAD'), merged)
+            self.assertEqual(git(endpoint, 'merge-base', pc, vm), base)
+            self.assertEqual((endpoint / 'pc.txt').read_text(), 'desktop commit')
+            self.assertEqual((endpoint / 'vm.txt').read_text(), 'phone commit')
 
     def test_update_interrupted_download_resumes(self):
         (self.source / 'file').write_text('first')

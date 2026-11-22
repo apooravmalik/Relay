@@ -1,5 +1,7 @@
+import { spawn } from 'node:child_process';
+import { homedir } from 'node:os';
 import { createServer } from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -148,9 +150,34 @@ export function interruptOnDisconnect(response, interrupt) {
 }
 
 function appError(error) {
+  if (error.code === 'WORKSPACE_BUSY') return [409, error.message];
   if (error instanceof CodexAppServerError && ['ACTIVE_WRITER', 'NO_ACTIVE_TURN'].includes(error.code)) return [409, error.message];
   if (error instanceof CodexAppServerError) return [502, error.message];
   return [400, error.message || 'Request could not be completed.'];
+}
+
+async function lockWorkspaceTurn(id) {
+  const folder = path.join(homedir(), '.relay-v0', 'controller', 'handoff-locks');
+  await mkdir(folder, { recursive: true, mode: 0o700 });
+  const child = spawn('flock', ['-n', path.join(folder, `${id}.lock`), 'sh', '-c', 'printf ready; cat >/dev/null'],
+    { stdio: ['pipe', 'pipe', 'ignore'] });
+  child.stdin.on('error', () => {});
+  return new Promise((resolve, reject) => {
+    const failed = () => {
+      const error = new Error('Workspace is busy. Finish the active chat turn or handoff and try again.');
+      error.code = 'WORKSPACE_BUSY';
+      reject(error);
+    };
+    child.once('error', failed);
+    child.once('exit', failed);
+    child.stdout.once('data', () => {
+      resolve(() => new Promise((released) => {
+        if (child.exitCode !== null || child.signalCode !== null) return released();
+        child.once('exit', released);
+        child.stdin.end();
+      }));
+    });
+  });
 }
 
 export function createRelayServer(dependencies = {}) {
@@ -271,6 +298,7 @@ export function createRelayServer(dependencies = {}) {
         const { text, model, effort } = await requestBody(request);
         if (typeof text !== 'string' || !text.trim() || text.length > 8000) return writeError(response, 400, 'Prompt must be between 1 and 8000 characters.');
         const selection = options.validateModelSelection(await options.listModels(), { model, effort });
+        const releaseTurn = await lockWorkspaceTurn(workspace.id);
         response.writeHead(200, {
           ...securityHeaders,
           'Cache-Control': 'no-store',
@@ -298,6 +326,7 @@ export function createRelayServer(dependencies = {}) {
           sseEvent(response, 'error', { status, message });
         }
         streamFinished();
+        await releaseTurn();
         return response.end();
       }
 
@@ -321,6 +350,7 @@ export function createRelayServer(dependencies = {}) {
         const { text, model, effort } = await requestBody(request);
         if (typeof text !== 'string' || !text.trim() || text.length > 8000) return writeError(response, 400, 'Prompt must be between 1 and 8000 characters.');
         const selection = options.validateModelSelection(await options.listModels(), { model, effort });
+        const releaseTurn = await lockWorkspaceTurn(workspace.id);
         response.writeHead(200, {
           ...securityHeaders,
           'Cache-Control': 'no-store',
@@ -345,6 +375,7 @@ export function createRelayServer(dependencies = {}) {
           sseEvent(response, 'error', { status, message });
         }
         streamFinished();
+        await releaseTurn();
         return response.end();
       }
       return writeError(response, 404, 'Not found.');

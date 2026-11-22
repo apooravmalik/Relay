@@ -7,13 +7,14 @@ usage() {
 Usage:
   relay doctor [--vm NAME]
   relay push --project DIR [--vm NAME]
-  relay push --workspace WORKSPACE_ID --project DIR [--file RELATIVE_PATH] --dry-run [--vm NAME] [--json]
-  relay push --workspace WORKSPACE_ID --project DIR [--file RELATIVE_PATH] [--resume] [--vm NAME] [--json]
+  relay push --workspace WORKSPACE_ID --project DIR [--file RELATIVE_PATH] [--commit OID] --dry-run [--vm NAME] [--json]
+  relay push --workspace WORKSPACE_ID --project DIR [--file RELATIVE_PATH] [--commit OID] [--expect PLAN_ID] [--resume] [--vm NAME] [--json]
   relay connect --project DIR [--vm NAME]
+  relay merge --workspace WORKSPACE_ID --project DIR [--vm NAME] [--json]
   relay workspaces [--vm NAME] [--json]
   relay pull --project DIR [--vm NAME] [--apply] > remote.patch
   relay pull --workspace WORKSPACE_ID --into DIR [--name NAME] [--vm NAME] --dry-run [--json]
-  relay pull --workspace WORKSPACE_ID --into DESTINATION --update [--dry-run] [--vm NAME] [--json]
+  relay pull --workspace WORKSPACE_ID --into DESTINATION --update [--commit OID] [--expect PLAN_ID] [--dry-run] [--vm NAME] [--json]
   relay pull --inspect-update DESTINATION [--vm NAME] [--json]
   relay pull --abort-update DESTINATION [--vm NAME] [--json]
   relay pull --resume-update DESTINATION [--vm NAME] [--json]
@@ -307,6 +308,7 @@ case ${1:-} in
   push) shift; command_push "$@" ;;
   connect) shift; command_connect "$@" ;;
   workspaces) shift; require python3; python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/relay_lib/import_workspace.py" --list "$@" ;;
+  merge) shift; require python3; python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/relay_lib/merge_workspace.py" "$@" ;;
   pull) shift; command_pull "$@" ;;
   -h|--help|help|'') usage ;;
   *) die "unknown command: $1" ;;

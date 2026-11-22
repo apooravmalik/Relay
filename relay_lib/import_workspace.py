@@ -14,7 +14,7 @@ import unicodedata
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from relay_lib.publication import publish_noreplace
-from relay_lib import update_workspace
+from relay_lib import export_workspace, update_workspace
 
 HELPER = (Path(__file__).resolve().parent / 'export_workspace.py').read_text()
 
@@ -60,7 +60,7 @@ def digest(path):
     return h.hexdigest()
 
 
-def verify_payload(root, manifest):
+def verify_payload(root, manifest, base=None):
     expected = {}
     for item in manifest['payload']:
         path = safe_path(item['path'])
@@ -79,6 +79,9 @@ def verify_payload(root, manifest):
             if rel not in expected or p.stat().st_size != expected[rel]['size'] or digest(p) != expected[rel]['sha256']:
                 raise ValueError('Payload verification failed.')
     if actual != set(expected): raise ValueError('Payload is incomplete.')
+    if manifest.get('delta_from') != (base['transfer_id'] if base else None):
+        raise ValueError('Payload baseline differs.')
+    previous = {item['path']: item for item in base['entries']} if base else {}
     seen = set()
     for entry in manifest['entries']:
         path = safe_path(entry['path'])
@@ -86,7 +89,7 @@ def verify_payload(root, manifest):
         if folded in seen: raise ValueError('Case or Unicode path collision.')
         seen.add(folded)
         if entry['type'] not in ('file', 'directory'): raise ValueError('Unsupported entry type.')
-        if entry['type'] == 'file':
+        if entry['type'] == 'file' and previous.get(path) != entry:
             payload_entry = expected.get('files/' + path)
             if not payload_entry or payload_entry['sha256'] != entry['sha256'] or payload_entry['size'] != entry['size']: raise ValueError('File manifest mismatch.')
 
@@ -171,6 +174,7 @@ def verify_project(project, manifest, ignore_paths=()):
         for name in dirs + files:
             path = Path(current) / name
             rel = path.relative_to(project).as_posix()
+            if rel in ignored: continue
             if path.is_symlink() or rel not in expected: raise ValueError('Published project verification failed.')
             entry = expected[rel]
             if entry['type'] == 'directory':
@@ -189,18 +193,22 @@ def verify_project(project, manifest, ignore_paths=()):
 
 def finish_transfer(args, state, state_file):
     manifest = state['manifest']
+    if not manifest['git'].get('policy_digest') and any(entry.get('path') == '.relayignore' for entry in manifest['entries']):
+        raise ValueError('unsupported_policy: Retained snapshot contains .relayignore; its rules cannot yet be enforced.')
     transfer = manifest['transfer_id']
     staging = Path(state['staging'])
     destination = Path(state['destination'])
     if not staging.is_dir() or staging.is_symlink() or staging.parent != destination.parent or not staging.name.startswith('.relay-import-'):
         raise ValueError('Transfer staging directory is unavailable or invalid.')
+    ssh, host = ssh_command(args.vm)
+    if remote(ssh, host, manifest['workspace_id'], 'policy')['digest'] != manifest['git'].get('policy_digest'):
+        raise ValueError('policy_mismatch: Source policy changed after capture.')
     if os.path.lexists(destination):
         if state.get('phase') != 'publishing' or (staging / 'project').exists() or destination.is_symlink() or not destination.is_dir():
             raise ValueError('Destination already exists; it has not been changed.')
         verify_payload(staging / 'payload', manifest)
         verify_project(destination, manifest)
         return complete_transfer(args, state, state_file)
-    ssh, host = ssh_command(args.vm)
     payload = staging / 'payload'
     payload.mkdir(exist_ok=True)
     print('relay: transferring snapshot ' + transfer, file=sys.stderr)
@@ -215,6 +223,8 @@ def finish_transfer(args, state, state_file):
     if project.exists(): shutil.rmtree(project)
     reconstruct(payload, project, manifest)
     verify_project(project, manifest)
+    if remote(ssh, host, manifest['workspace_id'], 'policy')['digest'] != manifest['git'].get('policy_digest'):
+        raise ValueError('policy_mismatch: Source policy changed after capture.')
     state['phase'] = 'publishing'
     write_json_atomic(state_file, state)
     publish_noreplace(project, destination)
@@ -228,6 +238,11 @@ def complete_transfer(args, state, state_file):
     payload = staging / 'payload'
     destination = Path(state['destination'])
     receipt = {'schema_version': 1, 'transfer_id': transfer, 'workspace_id': manifest['workspace_id'], 'vm': args.vm, 'destination': str(destination), 'head': manifest['git']['head'], 'exclusions': manifest['exclusions'], 'manifest_sha256': digest(payload / 'manifest.json')}
+    if manifest['git']['mode'] != 'plain':
+        try:
+            export_workspace.retain_git_snapshot(destination, manifest, payload)
+        except RuntimeError as exc:
+            raise ValueError(str(exc)) from exc
     update_workspace.pair_import(state, write_json_atomic)
     pair = json.loads(update_workspace.pairing_path(destination).read_text())
     acknowledged = update_workspace.remote_cp(sys.modules[__name__], state['vm'], pair, 'init', update_workspace.cp(pair))
@@ -247,7 +262,11 @@ def main(argv=None):
     parser.add_argument('--workspace'); parser.add_argument('--into'); parser.add_argument('--name'); parser.add_argument('--resume')
     parser.add_argument('--update', action='store_true'); parser.add_argument('--resume-update'); parser.add_argument('--inspect-update'); parser.add_argument('--abort-update')
     parser.add_argument('--vm', default='relay-v0'); parser.add_argument('--dry-run', action='store_true'); parser.add_argument('--json', action='store_true'); parser.add_argument('--list', action='store_true')
+    parser.add_argument('--commit')
+    parser.add_argument('--expect', metavar='PLAN_ID', help='reject changes since a Git dry run')
     args = parser.parse_args(argv)
+    if (args.commit or args.expect) and not args.update:
+        parser.error('--commit and --expect require --update')
     if args.inspect_update or args.abort_update:
         if sum(bool(x) for x in (args.inspect_update, args.abort_update, args.resume_update, args.workspace, args.into, args.name, args.resume, args.update, args.dry_run, args.list)) != 1: parser.error('inspect/abort cannot be combined with other transfer options')
         try: return update_workspace.manage(args, sys.modules[__name__])
@@ -304,7 +323,10 @@ def main(argv=None):
         print('relay: pause independent writers while capturing the workspace', file=sys.stderr)
         captured = remote(ssh, host, args.workspace, 'capture')
         manifest = captured['manifest']
-        if manifest['workspace_id'] != args.workspace or manifest['source_path'] != preview['source_path']: raise ValueError('Workspace identity changed.')
+        if manifest['workspace_id'] != args.workspace or manifest['source_path'] != preview['source_path']:
+            raise ValueError('Workspace identity changed.')
+        if any(manifest[key] != preview[key] for key in ('git', 'entries')):
+            raise ValueError('source_changed: Workspace changed between preview and capture.')
         staging = Path(tempfile.mkdtemp(prefix='.relay-import-', dir=parent))
         transfer = manifest['transfer_id']
         if len(transfer) != 32 or any(c not in '0123456789abcdef' for c in transfer): raise ValueError('Invalid transfer ID from VM.')
@@ -315,7 +337,7 @@ def main(argv=None):
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
         text = str(exc)
         code, sep, detail = text.partition(': ')
-        if sep and code in ('workspace_not_found', 'unsupported_git_state', 'excluded_tracked_file', 'unsupported_file', 'source_changed', 'source_busy', 'permission_denied', 'secret_detected', 'scan_limit'):
+        if sep and code in ('workspace_not_found', 'unsupported_git_state', 'unsupported_policy', 'invalid_policy', 'policy_mismatch', 'excluded_tracked_file', 'unsupported_file', 'source_changed', 'source_busy', 'permission_denied', 'secret_detected', 'scan_limit'):
             return fail(args, code, detail)
         return fail(args, 'import_failed', text)
 

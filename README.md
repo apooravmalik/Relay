@@ -1,9 +1,17 @@
 # Relay V0 prototype
 
-This is a narrow rehearsal of Relay's first handoff: a dirty Git working tree
-moves from macOS to an SSH target, then can be used through a remote `tmux`
-session. `--vm` accepts either a Lima VM name or a normal SSH host alias from
-`~/.ssh/config`.
+Relay is a private, single-owner prototype for working on VM workspaces from a
+phone and transferring them to or from a PC. Its CLI supports an initial Git
+push and legacy patch return, as well as a separate first import of a VM-created
+plain or supported Git workspace. `--vm` accepts a Lima VM name or an SSH host
+alias from `~/.ssh/config`.
+
+See [current progress](CURRENT_PROGRESS.md) for what has been tested and what
+remains, [the workspace data policy](VM_WORKSPACE_DATA_POLICY.md) for transfer
+selection and database handling, and [the test problems](PWA_TEST_PROBLEMS.md)
+for issues found during the phone-led RAG test.
+
+## Existing Git handoff
 
 ```bash
 ./relay doctor --vm relay-v0
@@ -42,8 +50,13 @@ List its ID, preview the import, and pull it into an existing local parent:
 Pause editors, agents, watchers and other writers while Relay captures the VM
 workspace. The destination must not already exist; pass `--name NAME` to select
 another folder name. Use `--json` for structured output. If rsync is interrupted,
-the error reports a transfer ID; retry with `relay pull --resume TRANSFER_ID
---vm relay-do-v0`. Successful imports leave a receipt under `~/.relay-v0/imports`.
+the error reports a transfer ID; retry with:
+
+```bash
+./relay pull --resume TRANSFER_ID --vm relay-do-v0
+```
+
+Successful imports leave a receipt under `~/.relay-v0/imports` on the PC.
 
 Plain folders stay plain. Supported Git repositories retain the checked-out
 commit and branch or detached state, staged changes, working files and
@@ -61,22 +74,71 @@ Git attributes, sparse or shallow repositories, merge conflicts and several
 other special Git states. Secrets are transferred as project files; no secret
 scanner blocks them. Treat the VM, local project and retained export as places
 that hold those secrets.
-Relay's capture lock coordinates other imports only; the before-and-after scan
-does not replace pausing independent writers or a filesystem snapshot. VM
+Relay coordinates captures and repeat Git publication with phone chat turns.
+Pause independent writers during handoffs. VM
 exports currently remain under `~/.relay-v0/exports`; automatic expiry and disk
 quota enforcement are not yet implemented. A copied `.bak` still needs to be
 restored with SQL Server. Stop SQLite writers and close connections, or place a
 consistent SQLite backup in the workspace before copying; Relay does not
 automatically create database backups or restore database services. Data stored
 outside the workspace, including separate Docker volumes, is not included.
-The legacy `pull --project` delta does not export Git-ignored changes; use a
-new workspace import for those files until a destination update workflow exists.
+The legacy `pull --project` delta does not export Git-ignored changes; use the
+workspace ID workflow for those files.
+
+## Repeat Git handoff
+
+Repeat transfers into a paired Git repository preserve the index and working
+files separately. Preview and run them with the same workspace ID and desktop
+path. Pass `--expect PLAN_ID` with the dry run's `plan_id` to apply only if both
+endpoints still match that preview. A file transfer keeps the current commit. To transfer an existing source
+commit, review the staged changes and commit, then pass `--commit FULL_OID`.
+Relay updates the receiving ref only when the approved commit descends from its
+current commit. Linked worktrees can be imported once but require a standalone
+repository on both endpoints for repeat handoffs.
+
+```bash
+./relay push --workspace ID --project PATH --vm relay-do-v0 --dry-run --json
+./relay push --workspace ID --project PATH --vm relay-do-v0 --json
+./relay pull --workspace ID --into PATH --update --vm relay-do-v0 --dry-run --json
+./relay pull --workspace ID --into PATH --update --vm relay-do-v0 --json
+```
+
+A root `.relayignore` uses `protect PATTERN` and `exclude PATTERN`. Blank lines
+and lines starting with `#` are allowed. Patterns without a slash match any
+component. Patterns containing a slash start at the root. `*` and `?` match
+within a component and a component consisting of `**` matches zero or more
+components. A matching directory rule applies below that directory. Exclude
+takes precedence and leaves endpoint copies local. Relay hides protected file
+contents from previews and scoped AI requests. Codex chat retains full VM-user
+access. The rule file itself is shared as policy metadata. Keep the same policy
+on both endpoints and at the checkpoint. To change it, make a fresh import into
+a new folder. Relay refuses to send history containing excluded paths.
+`.relayignore` does not rewrite Git history.
+
+Run `./relay merge --workspace ID --project PATH --vm relay-do-v0 --json` to
+prepare a review. Then use `--approve PLAN_ID` on the same command. Resolve each
+conflict with `--resolve worktree:PATH=pc`, `--resolve index:PATH=vm` or the
+actions reported in the plan. A history plan supplies a private repository with
+`pc` and `vm` review branches. When the tracked state is clean, review and create
+a descendant of both heads there, then pass `--approve PLAN_ID --commit FULL_OID`.
+A review or interrupted publication retains its private staging and originals.
+
+For an eligible text conflict, preview the scoped request with
+`--assist PLAN_ID --select worktree:PATH`. After reviewing the inputs, add
+`--provider /absolute/path/to/executable --approve-request`. The provider reads
+JSON on stdin and writes UTF-8 proposal text on stdout. Review the saved proposal
+before accepting it with `--approve PLAN_ID --resolve worktree:PATH=proposal`.
+Resolve protected files, databases and binaries by choosing an endpoint version.
+Resume an interrupted merge with `--resume PLAN_ID`.
 
 ## Private phone PWA
 
 The PWA is a private controller for the existing VM—not a browser terminal. It
-lists registered workspaces, opens saved Codex chats, streams a new prompt,
-shows changed files and diffs, and uses browser speech-to-text when supported.
+creates and opens registered folders, lists saved Codex chats, streams turns,
+browses visible files, shows changed files and diffs, and uses browser
+speech-to-text when supported. A chat attachment is saved under the workspace's
+`uploads/` directory and its path is sent to Codex; uploads are limited to
+10 MB. A loopback app can be opened through a private Tailscale preview link.
 Codex turns launched by the PWA use full VM access with no command approval
 prompt. Only grant the Tailnet owner access, and do not keep unrelated secrets
 or credentials readable by the `relay` user.
@@ -113,3 +175,19 @@ sudo tailscale serve --bg 4388
 
 Never use `tailscale funnel` for Relay. The controller stays on loopback and
 requires the owner login injected by Tailscale Serve.
+
+## Run checks
+
+```bash
+npm test
+python3 -m unittest relay_lib.test_import_workspace relay_lib.test_push_selection relay_lib.test_manifest relay_lib.test_publication relay_lib.test_monitor_rag
+```
+
+The [RAG test plan](PWA_RAG_VM_TEST_PLAN.md) covers the phone-to-VM journey and
+PC snapshot restore. The imported `rag-lab-test/` is a local test workspace and
+is ignored by Git; it is not packaged or deployed with Relay.
+
+The [end to end test plan](RELAY_E2E_TEST_PLAN.md) covers two phone and desktop
+handoff cycles for a plain folder and acceptance tests for repeat Git handoffs.
+The [Git handoff implementation plan](RELAY_GIT_HANDOFF_BUILD_PLAN.md) describes
+the build phases for worktree transfers, `.relayignore`, merge review and deployment.

@@ -56,7 +56,11 @@
             <button id="back-to-chats" class="icon-button small" type="button" aria-label="Back to conversations">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
             </button>
-            <div><strong id="chat-title"></strong><span id="chat-status" role="status" aria-live="polite">Ready</span></div>
+            <div>
+              <strong id="chat-title"></strong>
+              <span id="chat-status" role="status" aria-live="polite">Ready</span>
+              <span id="codex-access-note">Codex has full access as the VM user and can read files such as <code>.env</code>.</span>
+            </div>
             <button id="hide-chat" class="text-button" type="button">Hide</button>
           </div>
           <div id="message-list" class="message-list" aria-label="Conversation messages"></div>

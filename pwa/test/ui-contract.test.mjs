@@ -63,7 +63,6 @@ test('chat composer puts uploads and model settings behind a future-ready add me
   assert.match(markup, /id="model-settings-dialog"/);
   assert.match(markup, /id="git-status"/);
   assert.match(markup, /id="stop-turn"/);
-  assert.doesNotMatch(markup, /Codex runs with full VM access/);
   assert.match(app, /api\/workspaces\/\$\{state\.workspace\.id\}\/uploads/);
   assert.match(app, /Uploaded file: \$\{upload\.path\}/);
   assert.match(app, /uploadInput\.click\(\)/);
@@ -71,6 +70,10 @@ test('chat composer puts uploads and model settings behind a future-ready add me
   assert.match(stylesheet, /\.git-status\s*\{[^}]*border-radius:\s*999px/s);
   assert.match(stylesheet, /\.add-button\s*\{[^}]*font-size:\s*1\.65rem/s);
   assert.match(stylesheet, /\.tab\s*\{[^}]*font-size:\s*\.88rem/s);
+});
+
+test('the shared chat panel discloses Codex access before sending a message', () => {
+  assert.match(markup, /id="chat-panel"[\s\S]*id="codex-access-note"[^>]*>Codex has full access as the VM user and can read files such as <code>\.env<\/code>[\s\S]*id="composer"/);
 });
 
 test('chat controls expose working feedback, concise reasoning summaries, and a real stop route', () => {

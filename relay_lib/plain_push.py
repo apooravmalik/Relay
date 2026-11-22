@@ -27,6 +27,8 @@ def main(argv=None):
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--json', action='store_true')
     parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--commit')
+    parser.add_argument('--expect', metavar='PLAN_ID', help='reject changes since a Git dry run')
     args = parser.parse_args(argv)
     try:
         dest = Path(args.project).expanduser().absolute()
@@ -39,6 +41,7 @@ def main(argv=None):
         with pairfile.with_suffix('.lock').open('a') as lock:
             try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError: raise ValueError('BUSY: another transfer holds the pairing lock.')
+            if pairfile.with_suffix('.merge-pending.json').exists(): raise ValueError('RECOVERY_REQUIRED: a merge is pending.')
             if pairfile.with_suffix('.pending.json').exists(): raise ValueError('RECOVERY_REQUIRED: a pull is pending.')
             if args.resume:
                 if args.dry_run: raise ValueError('--resume cannot be used with --dry-run.')
@@ -66,7 +69,13 @@ def main(argv=None):
                         'workspace_id':args.workspace, 'vm':args.vm, 'destination':str(dest), 'source_path':manifest['source_path'],
                         'checkpoint_id':manifest['transfer_id'], 'parent_id':None, 'acknowledgment':'pending',
                         'git':manifest['git'], 'entries':manifest['entries'], 'exclusions':manifest['exclusions'], 'policy':'existing-import-inclusion-v1'}
-            if pair['git']['mode'] != 'plain': raise ValueError('UNSUPPORTED: only plain folders are supported.')
+            if pair['git']['mode'] != 'plain':
+                if args.file:
+                    raise ValueError('Git handoffs transfer the shared workspace state. Omit --file.')
+                from relay_lib import git_handoff
+                return git_handoff.start(args, imp, dest, pairfile, pair, 'push')
+            if args.commit or args.expect:
+                raise ValueError('--commit and --expect require a Git pairing.')
             git, entries, _ = upd.snapshot(dest)
             remote = imp.remote(ssh, host, args.workspace, 'preview')
             local_changes = upd.changes(pair['entries'], entries)

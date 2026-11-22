@@ -19,7 +19,11 @@ def main(argv):
     parser = argparse.ArgumentParser(prog='relay push')
     parser.add_argument('--workspace', required=True); parser.add_argument('--project', required=True)
     parser.add_argument('--vm', default='relay-v0'); parser.add_argument('--json', action='store_true'); parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--commit')
+    parser.add_argument('--expect', metavar='PLAN_ID', help='reject changes since a Git dry run')
     args = parser.parse_args(argv)
+    if (args.commit or args.expect) and args.resume:
+        parser.error('--resume uses the original preview and commit selection')
     try:
         dest = Path(args.project).expanduser().absolute()
         if dest.is_symlink() or not dest.is_dir() or dest.resolve() != dest: raise ValueError('Project must be an existing canonical directory.')
@@ -28,6 +32,7 @@ def main(argv):
         with pairfile.with_suffix('.lock').open('a') as lock:
             try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError: raise ValueError('BUSY: another transfer holds the pairing lock.')
+            if pairfile.with_suffix('.merge-pending.json').exists(): raise ValueError('RECOVERY_REQUIRED: a merge is pending.')
             if pairfile.with_suffix('.pending.json').exists(): raise ValueError('RECOVERY_REQUIRED: a pull is pending.')
             if args.resume:
                 if not pending.exists():
@@ -41,13 +46,22 @@ def main(argv):
                         raise ValueError('RECOVERY_REQUIRED: completed receipt no longer matches both endpoints.')
                     print(json.dumps(receipt, ensure_ascii=True)); return 0
                 op = json.loads(pending.read_text())
+                if op.get('kind') == 'git':
+                    if op['direction'] != 'push' or op['destination'] != str(dest) or op['vm'] != args.vm or op['base']['workspace_id'] != args.workspace or op['pairing'] != str(pairfile):
+                        raise ValueError('Pending Git handoff identity differs.')
+                    from relay_lib import git_handoff
+                    return git_handoff.finish(op, pending, imp, args.json)
                 if op.get('kind') != 'batch' or op['destination'] != str(dest) or op['vm'] != args.vm or op['base']['workspace_id'] != args.workspace: raise ValueError('Pending batch identity differs.')
                 return finish(op, pending, pairfile, args.json)
             if pending.exists(): raise ValueError('RECOVERY_REQUIRED: resume the pending push first.')
             if not pairfile.is_file(): raise ValueError('UNPAIRED: import and pair the folder before batch push.')
             pair = json.loads(pairfile.read_text())
             if pair['installation_id'] != upd.installation_id(imp.write_json_atomic) or pair['destination'] != str(dest) or pair['workspace_id'] != args.workspace or pair['vm'] != args.vm: raise ValueError('Pairing identity mismatch.')
-            if pair['git']['mode'] != 'plain': raise ValueError('UNSUPPORTED: only plain folders are supported.')
+            if pair['git']['mode'] != 'plain':
+                from relay_lib import git_handoff
+                return git_handoff.start(args, imp, dest, pairfile, pair, 'push')
+            if args.commit or args.expect:
+                raise ValueError('--commit and --expect require a Git pairing.')
             git, entries, _ = upd.snapshot(dest)
             ssh, host = imp.ssh_command(args.vm)
             remote = imp.remote(ssh, host, args.workspace, 'preview')

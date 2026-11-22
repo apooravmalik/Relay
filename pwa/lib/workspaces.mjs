@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readdir, readFile, realpath, rename, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readdir, readFile, realpath, rename, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { execFile as execFileCallback } from 'node:child_process';
 
@@ -216,7 +217,26 @@ function changedPath(record) {
 
 function isSensitivePath(relativePath) {
   const base = path.basename(relativePath).toLowerCase();
-  return base === '.env' || base.startsWith('.env.') || base.endsWith('.pem') || base.endsWith('.key') || base.startsWith('id_');
+  return base === '.env' || base.startsWith('.env.') || base.endsWith('.pem') || base.endsWith('.key') || base.endsWith('.p12') || base.endsWith('.pfx') || base.startsWith('id_');
+}
+
+const policyHelper = fileURLToPath(new URL('../../relay_lib/export_workspace.py', import.meta.url));
+
+async function allowedByPolicy(root, paths) {
+  if (!paths.length) return [];
+  try {
+    await lstat(path.join(root, '.relayignore'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return paths.map(() => true);
+    return paths.map(() => false);
+  }
+  try {
+    const { stdout } = await execFile('python3', [policyHelper, '--classify', root, ...paths], { timeout: 3000 });
+    const dispositions = JSON.parse(stdout);
+    return paths.map((_, index) => dispositions[index] === 'transfer');
+  } catch {
+    return paths.map(() => false);
+  }
 }
 
 async function workspaceDirectory(workspacePath, relativePath = '') {
@@ -235,14 +255,17 @@ export async function listWorkspaceFiles(workspacePath, relativePath = '') {
       const target = await realpath(path.join(selected.directory, entry.name));
       const metadata = await stat(target);
       if (!isWithin(selected.root, target) || (!metadata.isDirectory() && !metadata.isFile())) continue;
-      entries.push({ kind: metadata.isDirectory() ? 'directory' : 'file', name: entry.name, path: path.relative(selected.root, target) });
+      if (isSensitivePath(path.relative(selected.root, target))) continue;
+      entries.push({ requestedPath: path.relative(selected.root, path.join(selected.directory, entry.name)), kind: metadata.isDirectory() ? 'directory' : 'file', name: entry.name, path: path.relative(selected.root, target) });
     } catch {
       // Entries that disappear or resolve outside the workspace are never exposed.
     }
   }
+  const allowed = await allowedByPolicy(selected.root, entries.flatMap((entry) => [entry.requestedPath, entry.path]));
   return {
     path: path.relative(selected.root, selected.directory),
-    entries: entries.sort((left, right) => left.kind === right.kind ? left.name.localeCompare(right.name) : left.kind === 'directory' ? -1 : 1),
+    entries: entries.filter((_, index) => allowed[index * 2] && allowed[index * 2 + 1])
+      .map(({ requestedPath, ...entry }) => entry).sort((left, right) => left.kind === right.kind ? left.name.localeCompare(right.name) : left.kind === 'directory' ? -1 : 1),
   };
 }
 
@@ -251,14 +274,18 @@ export async function workspaceBrowseFile(workspacePath, relativePath) {
   const root = await realpath(workspacePath);
   const candidate = await realpath(path.resolve(root, safeRelativePath(relativePath)));
   if (!isWithin(root, candidate)) throw new Error('Invalid file path.');
+  if (isSensitivePath(path.relative(root, candidate))) throw new Error('Sensitive files are not available in Relay.');
   const metadata = await stat(candidate);
   if (!metadata.isFile() || metadata.size > maxPreviewBytes) throw new Error('File is too large for mobile preview.');
+  const names = [relativePath, path.relative(root, candidate)];
+  if (!(await allowedByPolicy(root, names)).every(Boolean)) throw new Error('File is not available for preview.');
   const content = await readFile(candidate);
+  if (!(await allowedByPolicy(root, names)).every(Boolean)) throw new Error('File is not available for preview.');
   if (content.includes(0)) throw new Error('Binary files cannot be previewed.');
   return { path: path.relative(root, candidate), content: content.toString('utf8') };
 }
 
-function statusEntries(statusOutput, untrackedOutput) {
+function statusEntries(statusOutput, untrackedOutput, includeSource = false) {
   const records = statusOutput.split('\0');
   const changes = [];
   for (let index = 0; index < records.length; index += 1) {
@@ -267,10 +294,12 @@ function statusEntries(statusOutput, untrackedOutput) {
     const status = record.slice(0, 2);
     if (status === '??') continue;
     const relativePath = changedPath(record);
+    let sourcePath = '';
     if ((status.includes('R') || status.includes('C')) && records[index + 1]) {
+      sourcePath = records[index + 1];
       index += 1;
     }
-    if (relativePath) changes.push({ path: relativePath, status, previewAllowed: !isSensitivePath(relativePath) });
+    if (relativePath) changes.push({ path: relativePath, status, previewAllowed: !isSensitivePath(relativePath) && !isSensitivePath(sourcePath), ...(includeSource && sourcePath ? { sourcePath } : {}) });
   }
   for (const relativePath of untrackedOutput.split('\0')) {
     if (relativePath) changes.push({ path: relativePath, status: '??', previewAllowed: !isSensitivePath(relativePath) });
@@ -349,7 +378,11 @@ export async function workspaceChanges(workspacePath) {
     git(workspacePath, ['status', '--porcelain=v1', '-z']),
     git(workspacePath, ['ls-files', '--others', '--exclude-standard', '-z']),
   ]);
-  return statusEntries(status, untracked);
+  const changes = statusEntries(status, untracked, true);
+  const allowed = await allowedByPolicy(workspacePath, changes.flatMap((entry) => [entry.path, entry.sourcePath || entry.path]));
+  return changes.map(({ sourcePath, ...entry }, index) => ({
+    ...entry, previewAllowed: entry.previewAllowed && allowed[index * 2] && allowed[index * 2 + 1],
+  }));
 }
 
 async function checkedChangedPath(workspacePath, relativePath) {
@@ -367,6 +400,8 @@ async function checkedChangedFile(workspacePath, relativePath) {
   const candidate = path.resolve(canonicalRoot, relativePath);
   const canonical = await realpath(candidate);
   if (!canonical.startsWith(`${canonicalRoot}${path.sep}`)) throw new Error('Invalid file path.');
+  if (!(await allowedByPolicy(canonicalRoot, [path.relative(canonicalRoot, canonical)]))[0]) throw new Error('File is not available for preview.');
+  if (isSensitivePath(path.relative(canonicalRoot, canonical))) throw new Error('Sensitive files are not available in Relay.');
   const metadata = await stat(canonical);
   if (!metadata.isFile() || metadata.size > maxPreviewBytes) throw new Error('File is too large for mobile preview.');
   return canonical;
@@ -375,6 +410,7 @@ async function checkedChangedFile(workspacePath, relativePath) {
 export async function workspaceFile(workspacePath, relativePath) {
   const filePath = await checkedChangedFile(workspacePath, relativePath);
   const content = await readFile(filePath);
+  await checkedChangedFile(workspacePath, relativePath);
   if (content.includes(0)) throw new Error('Binary files cannot be previewed.');
   return { path: relativePath, content: content.toString('utf8') };
 }
@@ -385,6 +421,7 @@ export async function workspaceDiff(workspacePath, relativePath) {
     gitOrNull(workspacePath, ['diff', '--cached', '--no-ext-diff', '--no-textconv', '--unified=3', '--', relativePath]),
     gitOrNull(workspacePath, ['diff', '--no-ext-diff', '--no-textconv', '--unified=3', '--', relativePath]),
   ]);
+  await checkedChangedPath(workspacePath, relativePath);
   if (staged || unstaged) {
     const diff = [staged && `Staged changes:\n${staged}`, unstaged && `Unstaged changes:\n${unstaged}`].filter(Boolean).join('\n\n');
     return { path: relativePath, diff };

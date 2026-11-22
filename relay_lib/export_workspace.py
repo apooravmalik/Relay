@@ -1,5 +1,6 @@
 """Remote, read-only workspace capture helper, executed by the local CLI over SSH."""
 import hashlib
+import fnmatch
 import fcntl
 import json
 import os
@@ -18,11 +19,11 @@ def error(code, message):
     raise RuntimeError(code + ': ' + message)
 
 
-def run_git(root, *args, check=True, env=None, output=subprocess.PIPE):
+def run_git(root, *args, check=True, env=None, output=subprocess.PIPE, stdin=None, input=None):
     clean = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
-    clean.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null', GIT_TERMINAL_PROMPT='0', GIT_OPTIONAL_LOCKS='0')
+    clean.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null', GIT_TERMINAL_PROMPT='0', GIT_OPTIONAL_LOCKS='0', GIT_NO_REPLACE_OBJECTS='1')
     if env: clean.update(env)
-    result = subprocess.run(['git', '-C', str(root), *args], stdout=output, stderr=subprocess.PIPE, env=clean)
+    result = subprocess.run(['git', '-C', str(root), *args], stdout=output, stderr=subprocess.PIPE, env=clean, stdin=stdin, input=input)
     if check and result.returncode:
         error('unsupported_git_state', 'Git could not read the workspace safely.')
     return result
@@ -57,6 +58,63 @@ def excluded_directory(name):
     return name.lower() in {'.git', 'node_modules', '.venv', 'venv', '__pycache__', '.cache'}
 
 
+def parse_relayignore(data):
+    """Parse root policy rules; slashless patterns match any path component.
+
+    Slash-containing patterns are root-relative; ** matches zero or more
+    components. Exclusion wins over protection regardless of rule order.
+    """
+    try:
+        text = data.decode('utf-8')
+    except UnicodeDecodeError:
+        error('invalid_policy', '.relayignore must be UTF-8.')
+    rules = []
+    for number, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith('#'): continue
+        parts = line.split()
+        if len(parts) != 2 or parts[0] not in ('protect', 'exclude'):
+            error('invalid_policy', 'Invalid .relayignore rule on line %d.' % number)
+        kind, pattern = parts
+        components = pattern.split('/')
+        if (pattern.startswith('/') or '\\' in pattern or '\x00' in pattern or
+                any(part in ('', '.', '..') for part in components) or
+                any('**' in part and part != '**' for part in components) or
+                any(c in pattern for c in '[]')):
+            error('invalid_policy', 'Invalid .relayignore pattern on line %d.' % number)
+        rules.append((kind, pattern))
+    return rules
+
+
+def relayignore_disposition(path, rules):
+    parts = path.split('/')
+    if not path or any(p in ('', '.', '..') for p in parts) or path.startswith('/'):
+        raise ValueError('Invalid policy path.')
+    if path == '.relayignore': return 'metadata'
+
+    def matches(pattern):
+        pats = pattern.split('/')
+        if len(pats) == 1:
+            return any(fnmatch.fnmatchcase(part, pattern) for part in parts)
+        reachable = {0}
+        for component in pats:
+            if not reachable:
+                return False
+            if component == '**':
+                reachable = set(range(min(reachable), len(parts) + 1))
+            else:
+                reachable = {i + 1 for i in reachable
+                             if i < len(parts) and fnmatch.fnmatchcase(parts[i], component)}
+        return bool(reachable)
+
+    kinds = {kind for kind, pattern in rules if matches(pattern)}
+    if 'exclude' in kinds: return 'exclude'
+    name = parts[-1].lower()
+    if ('protect' in kinds or name == '.env' or name.startswith('.env.') or
+            name.endswith(('.pem', '.key', '.p12', '.pfx')) or name.startswith('id_')): return 'protect'
+    return 'transfer'
+
+
 def sha(path):
     h = hashlib.sha256()
     flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
@@ -70,7 +128,49 @@ def sha(path):
     return h.hexdigest()
 
 
+def read_policy(root):
+    path = root / '.relayignore'
+    if not os.path.lexists(path):
+        return None, []
+    if not stat.S_ISREG(path.lstat().st_mode):
+        error('invalid_policy', '.relayignore must be a regular file.')
+    with os.fdopen(os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | os.O_NONBLOCK), 'rb') as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            error('invalid_policy', '.relayignore must be a regular file.')
+        raw = stream.read(65537)
+    if len(raw) > 65536:
+        error('invalid_policy', '.relayignore exceeds 64 KiB.')
+    return hashlib.sha256(raw).hexdigest(), parse_relayignore(raw)
+
+
+def excluded_path(path, rules):
+    return relayignore_disposition(path, rules) == 'exclude' or any(
+        excluded_directory(part) for part in path.split('/')[:-1])
+
+
+def validate_history(root, head, rules, gitdir):
+    # Walk every distinct reachable root tree. A path removed in a later
+    # commit still goes into a bundle and must pass the same exclusion rules.
+    if not head:
+        return
+    grafts = gitdir / 'info' / 'grafts'
+    if grafts.exists():
+        error('unsupported_git_state', 'Remove history grafts before transferring Git history.')
+    trees = run_git(root, 'log', '--format=%T', head, '--').stdout.splitlines()
+    if not trees:
+        error('unsupported_git_state', 'Cannot verify reachable Git history.')
+    for tree in dict.fromkeys(trees):
+        listing = run_git(root, 'ls-tree', '-r', '-z', tree.decode()).stdout
+        for record in filter(None, listing.split(b'\0')):
+            header, path = record.split(b'\t', 1)
+            if excluded_path(os.fsdecode(path), rules):
+                error('excluded_tracked_file', 'An excluded path exists in reachable Git history.')
+            if header.split()[1] == b'tree':
+                error('unsupported_git_state', 'Cannot verify reachable Git history.')
+
+
 def inspect(root, allow_parent_git=False):
+    policy, rules = read_policy(root)
     git = run_git(root, 'rev-parse', '--show-toplevel', check=False)
     meta = {'mode': 'plain', 'head': None, 'branch': None}
     tracked = None
@@ -101,7 +201,7 @@ def inspect(root, allow_parent_git=False):
             mode, oid, stage = header.split(b' ')
             if mode not in (b'100644', b'100755') or stage != b'0': error('unsupported_git_state', 'Submodules, symlink index entries and conflicts are not supported.')
             name = os.fsdecode(path)
-            if any(excluded_directory(part) for part in name.split('/')[:-1]): error('excluded_tracked_file', 'Tracked content is inside an excluded dependency or cache directory.')
+            if excluded_path(name, rules): error('excluded_tracked_file', 'An excluded path is present in the Git index.')
             tracked.add(name)
             index.append({'path': name, 'mode': mode.decode(), 'oid': oid.decode()})
         meta['index'] = index
@@ -109,6 +209,12 @@ def inspect(root, allow_parent_git=False):
         if run_git(root, 'config', '--get-regexp', r'^(extensions\.partialclone|remote\..*\.promisor)$', check=False).returncode == 0: error('unsupported_git_state', 'Partial repositories are not supported.')
         if (root / '.gitattributes').exists(): error('unsupported_git_state', 'Repositories with attributes require filter and LFS validation, which is not supported yet.')
     elif (root / '.git').exists() or (root / '.git').is_symlink(): error('unsupported_git_state', 'Git metadata could not be inspected.')
+    if policy is not None:
+        meta['policy_digest'] = policy
+    if meta['head']:
+        head_paths = run_git(root, 'ls-tree', '-r', '--name-only', '-z', meta['head']).stdout
+        if any(excluded_path(os.fsdecode(path), rules) for path in filter(None, head_paths.split(b'\0'))):
+            error('excluded_tracked_file', 'An excluded path is present at HEAD.')
     entries = []
     exclusions = []
     for current, dirs, files in os.walk(root, followlinks=False, onerror=lambda e: error('permission_denied', 'Cannot read workspace.')):
@@ -116,23 +222,85 @@ def inspect(root, allow_parent_git=False):
         for name in list(dirs):
             p = Path(current) / name
             rel = p.relative_to(root).as_posix()
-            if excluded_directory(name): dirs.remove(name); exclusions.append(rel); continue
+            if excluded_directory(name) or excluded_path(rel, rules):
+                dirs.remove(name); exclusions.append(rel); continue
             if p.is_symlink(): error('unsupported_file', 'Symlinks are not supported by this importer.')
             if (p / '.git').exists() or (p / '.git').is_symlink(): error('unsupported_git_state', 'Nested repositories are not supported.')
             entries.append({'path': rel, 'type': 'directory'})
         for name in files:
             p = Path(current) / name
             rel = p.relative_to(root).as_posix()
-            if rel == '.git': exclusions.append(rel); continue
+            if rel == '.git' or excluded_path(rel, rules): exclusions.append(rel); continue
             if tracked is not None and name == '.gitattributes': error('unsupported_git_state', 'Repositories with Git attributes require filter and LFS validation, which is not supported yet.')
             st = p.lstat()
             if not stat.S_ISREG(st.st_mode): error('unsupported_file', 'Symlinks and special files are not supported by this importer.')
             entries.append({'path': rel, 'type': 'file', 'size': st.st_size, 'mode': stat.S_IMODE(st.st_mode) & 0o777, 'sha256': sha(p)})
     entries.sort(key=lambda e: e['path'])
+    if next((entry.get('sha256') for entry in entries if entry['path'] == '.relayignore'), None) != policy:
+        error('source_changed', 'Transfer policy changed during inventory.')
     return meta, entries, sorted(exclusions)
 
 
-def capture(root, workspace_id):
+def content_store():
+    folder = Path.home() / '.relay-v0' / 'git-content'
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return folder
+
+
+def retain_git_snapshot(root, snapshot, payload=None):
+    """Keep private baseline versions addressed by their content."""
+    store = content_store()
+    wanted = [('file-' + item['sha256'], item['path']) for item in snapshot['entries'] if item['type'] == 'file']
+    wanted += [('blob-' + item['oid'], None) for item in snapshot['git']['index']]
+    for key, relative in wanted:
+        target = store / key
+        if target.exists():
+            continue
+        with tempfile.NamedTemporaryFile(dir=store) as out:
+            if relative is not None:
+                path = (payload / 'files' if payload else root) / relative
+                with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as stream:
+                    shutil.copyfileobj(stream, out)
+            elif payload:
+                with (payload / 'blobs' / key[5:]).open('rb') as stream:
+                    shutil.copyfileobj(stream, out)
+            else:
+                run_git(root, 'cat-file', 'blob', key[5:], output=out)
+            out.flush()
+            if relative is not None and sha(Path(out.name)) != key[5:]:
+                error('source_changed', 'File changed while storing the checkpoint.')
+            if relative is None:
+                out.seek(0)
+                if run_git(root, 'hash-object', '--stdin', stdin=out).stdout.decode().strip() != key[5:]:
+                    error('source_changed', 'Git blob changed while storing the checkpoint.')
+            os.fsync(out.fileno())
+            try:
+                os.link(out.name, target)
+            except FileExistsError:
+                pass
+    _batch_sync_dir(store)
+
+
+def make_history_bundle(root, meta, target, policy_root=None):
+    policy, rules = read_policy(policy_root or root)
+    if policy != meta.get('policy_digest'):
+        error('source_changed', 'Transfer policy changed before building the Git bundle.')
+    gitdir = Path(os.fsdecode(run_git(root, 'rev-parse', '--absolute-git-dir').stdout.rstrip(b'\n')))
+    validate_history(root, meta['head'], rules, gitdir)
+    scratch = Path(tempfile.mkdtemp(prefix='bundle-', dir=target))
+    try:
+        clean = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+        clean.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null', GIT_TERMINAL_PROMPT='0')
+        subprocess.run(['git', 'init', '--bare', '--quiet', '--object-format=' + meta['object_format'], str(scratch)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=clean)
+        run_git(scratch, '-c', 'core.hooksPath=/dev/null', 'fetch', '--quiet', '--no-tags', '--', str(root), meta['head'])
+        run_git(scratch, 'update-ref', 'refs/relay/export', meta['head'])
+        run_git(scratch, 'bundle', 'create', str(scratch / 'history.bundle'), 'refs/relay/export')
+        os.replace(scratch / 'history.bundle', target / 'history.bundle')
+    finally:
+        shutil.rmtree(scratch)
+
+
+def capture(root, workspace_id, include_history=True, against=None):
     # Compare complete inventories and index before and after copying. Independent
     # writers must still be paused: scans are not an atomic filesystem snapshot.
     export_root = Path.home() / '.relay-v0' / 'exports'
@@ -149,8 +317,12 @@ def capture(root, workspace_id):
     target = export_root / transfer
     target.mkdir(mode=0o700)
     try:
+        previous = {item['path']: item for item in against['entries']} if against else {}
+        known = {item['oid'] for item in against['git']['index']} if against else set()
         files = target / 'files'; files.mkdir()
         for entry in before[1]:
+            if previous.get(entry['path']) == entry:
+                continue
             dest = files / entry['path']
             if entry['type'] == 'directory': dest.mkdir(parents=True, exist_ok=True)
             else:
@@ -163,6 +335,8 @@ def capture(root, workspace_id):
         if meta['mode'].startswith('git_'):
             blobs = target / 'blobs'; blobs.mkdir()
             for item in meta['index']:
+                if item['oid'] in known:
+                    continue
                 blob = blobs / item['oid']
                 if not blob.exists():
                     with blob.open('xb') as output:
@@ -170,20 +344,17 @@ def capture(root, workspace_id):
                     with blob.open('rb') as saved:
                         if saved.read(43).startswith(b'version https://git-lfs.github.com/spec/v1\n'):
                             error('unsupported_git_state', 'Git LFS content is not supported.')
-            if meta['head']:
-                scratch = target / 'scratch.git'
-                clean = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
-                clean.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null', GIT_TERMINAL_PROMPT='0')
-                subprocess.run(['git', 'init', '--bare', '--quiet', '--object-format=' + meta['object_format'], str(scratch)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=clean)
-                run_git(scratch, '-c', 'core.hooksPath=/dev/null', 'fetch', '--quiet', '--no-tags', '--', str(root), meta['head'])
-                run_git(scratch, 'update-ref', 'refs/relay/export', meta['head'])
-                run_git(scratch, 'bundle', 'create', str(target / 'history.bundle'), 'refs/relay/export')
-                shutil.rmtree(scratch)
+            if include_history and meta['head']:
+                make_history_bundle(root, meta, target)
         if inspect(root) != before: error('source_changed', 'Workspace changed during capture; pause writers and retry.')
         payload = []
         for path in sorted(target.rglob('*')):
             if path.is_file(): payload.append({'path': path.relative_to(target).as_posix(), 'size': path.stat().st_size, 'sha256': sha(path)})
         manifest = {'schema_version': 1, 'transfer_id': transfer, 'workspace_id': workspace_id, 'source_path': str(root), 'name': root.name, 'created_at': int(time.time()), 'git': meta, 'entries': before[1], 'exclusions': before[2], 'payload': payload, 'consistency': 'independent writers must be paused during capture'}
+        if against is not None:
+            manifest['delta_from'] = against['transfer_id']
+        if meta['mode'] != 'plain':
+            retain_git_snapshot(root, manifest, target if against is None else None)
         (target / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=True, sort_keys=True, separators=(',', ':')))
         return manifest, str(target)
     except BaseException:
@@ -254,7 +425,7 @@ def export_manifest(root, workspace_id, request):
     raw = path.read_bytes()
     manifest = json.loads(raw)
     if manifest['workspace_id'] != workspace_id or manifest['source_path'] != str(root): error('checkpoint_mismatch', 'Original export identity differs.')
-    return {'manifest': manifest, 'sha256': hashlib.sha256(raw).hexdigest()}
+    return {'manifest': manifest, 'sha256': hashlib.sha256(raw).hexdigest(), 'export_path': str(path.parent)}
 
 
 def _push_assert_idle(root):
@@ -407,6 +578,18 @@ def _batch_directory(transfer):
     return root / transfer
 
 
+def turn_lock(workspace_id):
+    path = Path.home() / '.relay-v0' / 'controller' / 'handoff-locks' / (workspace_id + '.lock')
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock = path.open('a')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        error('source_busy', 'A Relay chat turn or workspace handoff is active.')
+    return lock
+
+
 def _batch_lock(workspace_id):
     path = Path.home() / '.relay-v0' / 'exports' / (workspace_id + '.lock')
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -440,13 +623,7 @@ def batch_begin(root, workspace_id, request):
             if root.stat().st_dev != directory.parent.stat().st_dev: error('unsupported_file', 'Workspace and VM staging must be on the same filesystem.')
             if shutil.disk_usage(directory.parent).free < required + 1024 * 1024: error('insufficient_space', 'Insufficient VM disk space for staging.')
             directory.mkdir(mode=0o700, exist_ok=True)
-            for name in ('incoming', 'backup', 'dirslots'):
-                (directory / name).mkdir(mode=0o700, exist_ok=True)
-            for index, op in enumerate(operations):
-                if op['action'] == 'mkdir':
-                    slot = directory / 'dirslots' / str(index)
-                    slot.mkdir(mode=0o700, exist_ok=True)
-                    st = slot.stat(); op['dev'] = st.st_dev; op['ino'] = st.st_ino
+            prepare_slots(directory, operations)
             state = {'identity':identity, 'operations':operations, 'phase':'uploading', 'cursor':0}
             _push_write_json(state_path, state)
         return {'phase':state['phase'], 'upload_path':str(directory / 'incoming'), 'transfer_id':transfer}
@@ -461,16 +638,27 @@ def _batch_matches(path, entry):
 
 def _batch_noreplace(source, target):
     import ctypes
-    libc = ctypes.CDLL(None, use_errno=True); rename = getattr(libc, 'renameat2', None)
-    if rename is None: error('unsupported_file', 'Atomic no-replace rename unavailable on the VM.')
-    if rename(-100, os.fsencode(source), -100, os.fsencode(target), 1): raise OSError(ctypes.get_errno(), 'Atomic no-replace rename failed.')
+    _atomic_rename(ctypes, source, target, 1, 4)
 
 
 def _batch_exchange(source, target):
     import ctypes
-    libc = ctypes.CDLL(None, use_errno=True); rename = getattr(libc, 'renameat2', None)
-    if rename is None: error('unsupported_file', 'Atomic exchange unavailable on the VM.')
-    if rename(-100, os.fsencode(source), -100, os.fsencode(target), 2): raise OSError(ctypes.get_errno(), 'Atomic exchange failed.')
+    _atomic_rename(ctypes, source, target, 2, 2)
+
+
+def _atomic_rename(ctypes, source, target, linux_flags, mac_flags):
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == 'darwin':
+        rename = getattr(libc, 'renamex_np', None)
+        args = (os.fsencode(source), os.fsencode(target), mac_flags)
+    else:
+        rename = getattr(libc, 'renameat2', None)
+        args = (-100, os.fsencode(source), -100, os.fsencode(target), linux_flags)
+    if rename is None:
+        error('unsupported_file', 'Required atomic rename operation is unavailable.')
+    if rename(*args):
+        raise OSError(ctypes.get_errno(), 'Atomic rename failed.')
+
 
 
 def _batch_sync_dir(path):
@@ -487,22 +675,7 @@ def batch_apply(root, workspace_id, request):
         if state['identity'] != identity: error('checkpoint_mismatch', 'Transfer identity changed.')
         base, proposed = identity['base'], identity['proposed']; ops = state['operations']
         if state['phase'] == 'uploading':
-            expected_files = {op['path'] for op in ops if op['action'] in ('add','modify')}
-            actual_files = set()
-            incoming = directory / 'incoming'
-            for current, dirs, files in os.walk(incoming, followlinks=False):
-                if any((Path(current) / name).is_symlink() for name in dirs): error('unsupported_file', 'Symlink in staged payload.')
-                for name in files:
-                    p = Path(current) / name; rel = p.relative_to(incoming).as_posix()
-                    if p.is_symlink() or not p.is_file(): error('unsupported_file', 'Invalid staged payload.')
-                    actual_files.add(rel)
-            if actual_files != expected_files: error('transfer_incomplete', 'Staged payload is missing files or contains unexpected files.')
-            for op in ops:
-                if op['action'] in ('add', 'modify'):
-                    path = incoming / op['path']; entry = op['new']
-                    if path.stat().st_size != entry['size'] or sha(path) != entry['sha256']: error('transfer_incomplete', 'Staged file checksum differs.')
-                    os.chmod(path, entry['mode'])
-                    with path.open('rb') as f: os.fsync(f.fileno())
+            verify_incoming(directory, ops)
             meta, entries, exclusions = inspect(root)
             if meta != base['git'] or entries != base['entries']: error('conflict', 'VM workspace changed during transfer.')
             deleted_dirs = [op['path'] for op in ops if op['action'] == 'rmdir']
@@ -520,41 +693,7 @@ def batch_apply(root, workspace_id, request):
             state['phase'] = 'publishing'; _push_write_json(state_path, state)
         if state['phase'] == 'publishing':
             _push_assert_idle(root)
-            while state['cursor'] < len(ops):
-                index = state['cursor']; op = ops[index]; path = op['path']; parts = path.split('/')
-                target = root / path; staged = directory / 'incoming' / path; backup = directory / 'backup' / str(index); slot = directory / 'dirslots' / str(index)
-                if any((root.joinpath(*parts[:n])).is_symlink() for n in range(1, len(parts)+1)): error('unsupported_file', 'Symlink encountered in destination.')
-                action = op['action']; already = False
-                if action == 'modify': already = _batch_matches(target, op['new']) and _batch_matches(staged, op['old'])
-                elif action == 'add': already = _batch_matches(target, op['new']) and not os.path.lexists(staged)
-                elif action == 'delete': already = not os.path.lexists(target) and _batch_matches(backup, op['old'])
-                elif action == 'mkdir':
-                    already = target.is_dir() and not target.is_symlink() and not slot.exists() and (target.stat().st_dev, target.stat().st_ino) == (op['dev'], op['ino'])
-                elif action == 'rmdir': already = not os.path.lexists(target) and backup.is_dir() and not backup.is_symlink() and not any(backup.iterdir())
-                expected = {x['path']:x for x in base['entries']}
-                for previous in ops[:index + (1 if already else 0)]:
-                    if previous['new'] is None: expected.pop(previous['path'], None)
-                    else: expected[previous['path']] = previous['new']
-                meta, entries, _ = inspect(root)
-                if meta != base['git'] or entries != sorted(expected.values(), key=lambda x:x['path']): error('recovery_required', 'Workspace changed or partially published; prior files are retained.')
-                if not already:
-                    if action == 'modify':
-                        if not _batch_matches(target, op['old']) or not _batch_matches(staged, op['new']): error('recovery_required', 'File preconditions changed.')
-                        _batch_exchange(staged, target); _batch_sync_dir(staged.parent); _batch_sync_dir(target.parent)
-                    elif action == 'add':
-                        if os.path.lexists(target) or not _batch_matches(staged, op['new']): error('recovery_required', 'Added file preconditions changed.')
-                        _batch_noreplace(staged, target); _batch_sync_dir(staged.parent); _batch_sync_dir(target.parent)
-                    elif action == 'delete':
-                        if not _batch_matches(target, op['old']) or os.path.lexists(backup): error('recovery_required', 'Deleted file preconditions changed.')
-                        _batch_noreplace(target, backup); _batch_sync_dir(backup.parent); _batch_sync_dir(target.parent)
-                    elif action == 'mkdir':
-                        if os.path.lexists(target) or not slot.is_dir() or (slot.stat().st_dev, slot.stat().st_ino) != (op['dev'], op['ino']): error('recovery_required', 'Directory preconditions changed.')
-                        _batch_noreplace(slot, target); _batch_sync_dir(slot.parent); _batch_sync_dir(target.parent)
-                    elif action == 'rmdir':
-                        if not target.is_dir() or target.is_symlink() or any(target.iterdir()) or os.path.lexists(backup): error('recovery_required', 'Deleted directory is not empty or changed.')
-                        _batch_noreplace(target, backup); _batch_sync_dir(backup.parent); _batch_sync_dir(target.parent)
-                        if any(backup.iterdir()): error('recovery_required', 'Deleted directory was modified; retained in recovery.')
-                state['cursor'] += 1; _push_write_json(state_path, state)
+            publish_files(root, directory, state_path, state, base, ops)
             meta, entries, _ = inspect(root)
             if meta != proposed['git'] or entries != proposed['entries']: error('recovery_required', 'Published workspace does not match the candidate.')
             state['phase'] = 'published'; _push_write_json(state_path, state)
@@ -575,14 +714,303 @@ def batch_apply(root, workspace_id, request):
             return {'status':'SUCCESS', 'transfer_id':identity['transfer_id'], 'recovery_path':str(directory), 'checkpoint':current['checkpoint']}
         error('recovery_required', 'Unknown batch transfer phase.')
 
+def publish_files(root, directory, state_path, state, base, ops):
+    while state['cursor'] < len(ops):
+        index = state['cursor']; op = ops[index]; path = op['path']; parts = path.split('/')
+        target = root / path; staged = directory / 'incoming' / path; backup = directory / 'backup' / str(index); slot = directory / 'dirslots' / str(index)
+        if any((root.joinpath(*parts[:n])).is_symlink() for n in range(1, len(parts)+1)): error('unsupported_file', 'Symlink encountered in destination.')
+        action = op['action']; already = False
+        if action == 'modify': already = _batch_matches(target, op['new']) and _batch_matches(staged, op['old'])
+        elif action == 'add': already = _batch_matches(target, op['new']) and not os.path.lexists(staged)
+        elif action == 'delete': already = not os.path.lexists(target) and _batch_matches(backup, op['old'])
+        elif action == 'mkdir':
+            already = target.is_dir() and not target.is_symlink() and not slot.exists() and (target.stat().st_dev, target.stat().st_ino) == (op['dev'], op['ino'])
+        elif action == 'rmdir': already = not os.path.lexists(target) and backup.is_dir() and not backup.is_symlink() and not any(backup.iterdir())
+        expected = {x['path']:x for x in base['entries']}
+        for previous in ops[:index + (1 if already else 0)]:
+            if previous['new'] is None: expected.pop(previous['path'], None)
+            else: expected[previous['path']] = previous['new']
+        meta, entries, _ = inspect(root)
+        if meta != base['git'] or entries != sorted(expected.values(), key=lambda x:x['path']): error('recovery_required', 'Workspace changed or partially published; prior files are retained.')
+        if not already:
+            if action == 'modify':
+                if not _batch_matches(target, op['old']) or not _batch_matches(staged, op['new']): error('recovery_required', 'File preconditions changed.')
+                _batch_exchange(staged, target); _batch_sync_dir(staged.parent); _batch_sync_dir(target.parent)
+            elif action == 'add':
+                if os.path.lexists(target) or not _batch_matches(staged, op['new']): error('recovery_required', 'Added file preconditions changed.')
+                _batch_noreplace(staged, target); _batch_sync_dir(staged.parent); _batch_sync_dir(target.parent)
+            elif action == 'delete':
+                if not _batch_matches(target, op['old']) or os.path.lexists(backup): error('recovery_required', 'Deleted file preconditions changed.')
+                _batch_noreplace(target, backup); _batch_sync_dir(backup.parent); _batch_sync_dir(target.parent)
+            elif action == 'mkdir':
+                if os.path.lexists(target) or not slot.is_dir() or (slot.stat().st_dev, slot.stat().st_ino) != (op['dev'], op['ino']): error('recovery_required', 'Directory preconditions changed.')
+                _batch_noreplace(slot, target); _batch_sync_dir(slot.parent); _batch_sync_dir(target.parent)
+            elif action == 'rmdir':
+                if not target.is_dir() or target.is_symlink() or any(target.iterdir()) or os.path.lexists(backup): error('recovery_required', 'Deleted directory is not empty or changed.')
+                _batch_noreplace(target, backup); _batch_sync_dir(backup.parent); _batch_sync_dir(target.parent)
+                if any(backup.iterdir()): error('recovery_required', 'Deleted directory was modified; retained in recovery.')
+        state['cursor'] += 1; _push_write_json(state_path, state)
+
+
+def verify_incoming(directory, ops):
+    expected_files = {op['path'] for op in ops if op['action'] in ('add','modify')}
+    actual_files = set()
+    incoming = directory / 'incoming'
+    for current, dirs, files in os.walk(incoming, followlinks=False):
+        if any((Path(current) / name).is_symlink() for name in dirs): error('unsupported_file', 'Symlink in staged payload.')
+        for name in files:
+            p = Path(current) / name; rel = p.relative_to(incoming).as_posix()
+            if p.is_symlink() or not p.is_file(): error('unsupported_file', 'Invalid staged payload.')
+            actual_files.add(rel)
+    if actual_files != expected_files: error('transfer_incomplete', 'Staged payload is missing files or contains unexpected files.')
+    for op in ops:
+        if op['action'] in ('add', 'modify'):
+            path = incoming / op['path']; entry = op['new']
+            if path.stat().st_size != entry['size'] or sha(path) != entry['sha256']: error('transfer_incomplete', 'Staged file checksum differs.')
+            os.chmod(path, entry['mode'])
+            with path.open('rb') as f: os.fsync(f.fileno())
+
+
+def prepare_slots(directory, operations):
+    for name in ('incoming', 'backup', 'dirslots'):
+        (directory / name).mkdir(mode=0o700, exist_ok=True)
+    for index, op in enumerate(operations):
+        if op['action'] == 'mkdir':
+            slot = directory / 'dirslots' / str(index)
+            slot.mkdir(mode=0o700, exist_ok=True)
+            st = slot.stat(); op['dev'] = st.st_dev; op['ino'] = st.st_ino
+
+
+def direct_git_directory(root):
+    gitdir = root / '.git'
+    if gitdir.is_symlink() or not gitdir.is_dir():
+        error('unsupported_git_state', 'Repeat handoffs require a repository with its own .git directory.')
+    common = run_git(root, 'rev-parse', '--path-format=absolute', '--git-common-dir').stdout.rstrip(b'\n')
+    if Path(os.fsdecode(common)) != gitdir:
+        error('unsupported_git_state', 'Linked worktrees are not supported for repeat handoffs.')
+    if os.path.lexists(gitdir / 'index.lock') or os.path.lexists(gitdir / 'HEAD.lock'):
+        error('source_busy', 'Git has locked the index. Finish the running Git command.')
+    if run_git(root, 'rev-parse', '--shared-index-path').stdout.strip():
+        error('unsupported_git_state', 'Disable split-index before a repeat handoff.')
+    index = gitdir / 'index'
+    if os.path.lexists(index) and not stat.S_ISREG(index.lstat().st_mode):
+        error('unsupported_git_state', 'Git index must be a regular file.')
+    return gitdir
+
+
+def validate_git_transition(base, proposed):
+    a, b = base['git'], proposed['git']
+    if any(a.get(key) != b.get(key) for key in ('object_format', 'branch', 'policy_digest')):
+        error('unsupported_git_state', 'Branch, object format or transfer policy differs.')
+    if a['mode'] not in ('git_committed', 'git_unborn') or b['mode'] not in ('git_committed', 'git_unborn'):
+        error('unsupported_git_state', 'Both endpoints must be Git repositories.')
+    if a['head'] != b['head'] and not b['head']:
+        error('unsupported_git_state', 'Cannot transfer a change to an unborn HEAD.')
+    return _batch_paths(base, proposed)
+
+
+def check_git_snapshot(root, expected):
+    direct_git_directory(root)
+    meta, entries, exclusions = inspect(root)
+    if meta != expected['git'] or entries != expected['entries']:
+        error('conflict', 'Workspace or transfer policy changed since planning.')
+    return exclusions
+
+
+def check_deletions(operations, exclusions):
+    for op in operations:
+        if op['action'] == 'rmdir' and any(path.startswith(op['path'] + '/') for path in exclusions):
+            error('conflict', 'A directory to be deleted contains excluded destination data.')
+
+
+def prepare_git_index(root, directory, old, new):
+    gitdir = direct_git_directory(root)
+    index = gitdir / 'index'
+    ready = directory / 'index.candidate'
+    if ready.exists():
+        ready.unlink()
+    env = {'GIT_INDEX_FILE': str(ready)}
+    run_git(root, '-c', 'core.splitIndex=false', 'read-tree', '--empty', env=env)
+    records = bytearray()
+    old_oids = {item['oid'] for item in old['index']}
+    length = {'sha1': 40, 'sha256': 64}[new['object_format']]
+    rules = read_policy(root)[1]
+    for entry in new['index']:
+        oid = entry['oid']
+        path = entry['path']
+        parts = path.split('/')
+        if (not re.fullmatch('[a-f0-9]{%d}' % length, oid) or
+                entry['mode'] not in ('100644', '100755') or '\0' in path or
+                any(part in ('', '.', '..') or part.lower() == '.git' for part in parts) or
+                excluded_path(path, rules)):
+            error('invalid_request', 'Unsafe Git index entry.')
+        if oid not in old_oids:
+            blob = directory / 'blobs' / oid
+            with os.fdopen(os.open(blob, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), 'rb') as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    error('transfer_incomplete', 'Invalid staged Git blob.')
+                if stream.read(43).startswith(b'version https://git-lfs.github.com/spec/v1\n'):
+                    error('unsupported_git_state', 'Git LFS content is not supported.')
+                stream.seek(0)
+                actual = run_git(root, 'hash-object', '-w', '--stdin', stdin=stream).stdout.decode().strip()
+            if actual != oid:
+                error('transfer_incomplete', 'Staged Git blob checksum differs.')
+        records.extend((entry['mode'] + ' ' + oid + '\t').encode() + os.fsencode(path) + b'\0')
+    run_git(root, '-c', 'core.splitIndex=false', 'update-index', '-z', '--index-info', env=env, input=bytes(records))
+    with ready.open('rb') as stream:
+        os.fsync(stream.fileno())
+    if ready.stat().st_dev != gitdir.stat().st_dev:
+        error('unsupported_file', 'Git index and staging must be on the same filesystem.')
+    return {'before': sha(index) if index.exists() else None, 'after': sha(ready)}
+
+
+def install_git_index(root, directory, record):
+    index = direct_git_directory(root) / 'index'
+    ready = directory / 'index.candidate'
+    live = sha(index) if index.exists() else None
+    staged = sha(ready) if ready.exists() else None
+    old, new = record['before'], record['after']
+    if live == new and staged == old:
+        return
+    if (live, staged) != (old, new):
+        error('recovery_required', 'Git index changed during publication; recovery copies are retained.')
+    if old is None:
+        _batch_noreplace(ready, index)
+    else:
+        _batch_exchange(ready, index)
+    _batch_sync_dir(index.parent)
+    _batch_sync_dir(directory)
+
+
+def prepare_commit(root, directory, old, new):
+    if old['head'] == new['head']:
+        return
+    bundle = directory / 'history.bundle'
+    if bundle.is_symlink() or not bundle.is_file():
+        error('transfer_incomplete', 'The selected commit bundle is missing.')
+    # Check the advertised ref before importing. unbundle leaves local refs,
+    # FETCH_HEAD, remotes and worktree registration alone.
+    refs = run_git(root, 'bundle', 'list-heads', str(bundle)).stdout.splitlines()
+    if refs != [(new['head'] + ' refs/relay/export').encode()]:
+        error('transfer_incomplete', 'Commit bundle does not advertise the selected commit.')
+    run_git(root, 'bundle', 'unbundle', str(bundle))
+    if old['head'] and run_git(root, 'merge-base', '--is-ancestor', old['head'], new['head'], check=False).returncode:
+        error('conflict', 'Commit history diverged. Review the histories before publishing.')
+    validate_history(root, new['head'], read_policy(root)[1], direct_git_directory(root))
+
+
+def publish_git(root, directory, base, proposed):
+    state_path = directory / 'journal.json'
+    if state_path.exists():
+        state = json.loads(state_path.read_text())
+        if state['base'] != base or state['proposed'] != proposed:
+            error('checkpoint_mismatch', 'Publication journal identity differs.')
+    else:
+        ops = validate_git_transition(base, proposed)
+        check_deletions(ops, check_git_snapshot(root, base))
+        verify_incoming(directory, ops)
+        prepare_slots(directory, ops)
+        prepare_commit(root, directory, base['git'], proposed['git'])
+        record = None
+        if base['git']['index'] != proposed['git']['index']:
+            record = prepare_git_index(root, directory, base['git'], proposed['git'])
+        state = {'base': base, 'proposed': proposed, 'operations': ops, 'index': record,
+                 'phase': 'files', 'cursor': 0}
+        _push_write_json(state_path, state)
+
+    if state['phase'] == 'files':
+        publish_files(root, directory, state_path, state, base, state['operations'])
+        check_git_snapshot(root, dict(base, entries=proposed['entries']))
+        state['phase'] = 'index'
+        _push_write_json(state_path, state)
+    if state['phase'] == 'index':
+        meta, entries, _ = inspect(root)
+        new_index = dict(base['git'], index=proposed['git']['index'])
+        if entries != proposed['entries'] or meta not in (base['git'], new_index):
+            error('recovery_required', 'Workspace changed before index publication.')
+        if state['index']:
+            install_git_index(root, directory, state['index'])
+        check_git_snapshot(root, dict(proposed, git=new_index))
+        state['phase'] = 'ref'
+        _push_write_json(state_path, state)
+    if state['phase'] == 'ref':
+        old, new = base['git'], proposed['git']
+        if old['head'] != new['head']:
+            meta, entries, _ = inspect(root)
+            if meta != new or entries != proposed['entries']:
+                check_git_snapshot(root, dict(proposed, git=dict(old, index=new['index'])))
+                ref = old['branch'] or 'HEAD'
+                before = old['head'] or ('0' * len(new['head']))
+                run_git(root, '-c', 'core.hooksPath=/dev/null', 'update-ref', '--no-deref', ref, new['head'], before)
+        check_git_snapshot(root, proposed)
+        state['phase'] = 'published'
+        _push_write_json(state_path, state)
+    if state['phase'] != 'published':
+        error('recovery_required', 'Unknown Git publication phase.')
+    check_git_snapshot(root, proposed)
+    retain_git_snapshot(root, proposed)
+
+
+def git_handoff_remote(root, workspace_id, action, request):
+    base, proposed = request['base'], request['proposed']
+    transfer, endpoint = proposed['transfer_id'], base['endpoint']
+    if (not re.fullmatch(r'[0-9a-f]{32}', transfer) or not re.fullmatch(r'[0-9a-f]{64}', endpoint) or
+            any(cp['source_path'] != str(root) or cp['workspace_id'] != workspace_id or cp['endpoint'] != endpoint
+                for cp in (base, proposed)) or proposed['parent_id'] != base['transfer_id'] or
+            proposed['generation'] != base['generation'] + 1):
+        error('checkpoint_mismatch', 'Git handoff identity differs.')
+    receiving = request.get('receiving', base)
+    identity = {'endpoint': endpoint}
+    directory = _batch_directory(transfer)
+    with turn_lock(workspace_id), _batch_lock(workspace_id):
+        current = checkpoint(root, workspace_id, dict(identity, action='get'))
+        done = current == {'checkpoint': proposed, 'pending': None}
+        if not done and (current['checkpoint'] != base or current['pending'] not in (None, proposed)):
+            error('checkpoint_mismatch', 'Remote checkpoint differs.')
+        if action == 'git_begin':
+            if not (directory / 'journal.json').exists() and not done:
+                check_deletions(validate_git_transition(receiving, proposed), check_git_snapshot(root, receiving))
+                _push_assert_idle(root)
+                directory.mkdir(mode=0o700, exist_ok=True)
+                if root.stat().st_dev != directory.stat().st_dev:
+                    error('unsupported_file', 'VM workspace and staging must share a filesystem.')
+            return {'directory': str(directory), 'upload': not done and not (directory / 'journal.json').exists()}
+
+        pushing = action in ('git_apply', 'git_ack_push')
+        if pushing:
+            _push_assert_idle(root)
+            if not done and action == 'git_apply':
+                export = Path.home() / '.relay-v0' / 'exports' / transfer
+                export.mkdir(mode=0o700, exist_ok=True)
+                _push_write_json(export / 'manifest.json', proposed)
+                checkpoint(root, workspace_id, dict(identity, action='prepare', checkpoint=proposed))
+                publish_git(root, directory, receiving, proposed)
+                return {'status': 'PUBLISHED', 'recovery_path': str(directory)}
+        check_git_snapshot(root, proposed)
+        if not pushing:
+            _push_assert_idle(root)
+        if not done:
+            if action == 'git_prepare_pull':
+                checkpoint(root, workspace_id, dict(identity, action='prepare', checkpoint=proposed))
+            else:
+                checkpoint(root, workspace_id, dict(identity, action='commit', transfer_id=transfer))
+        return {'status': 'SUCCESS', 'checkpoint': proposed, 'recovery_path': str(directory) if pushing else None}
+
+
 def main():
     try:
         workspace_id, action = sys.argv[1:3]
+        if workspace_id == '--classify' and len(sys.argv) >= 4:
+            rules = read_policy(Path(action))[1]
+            print(json.dumps([relayignore_disposition(path, rules) for path in sys.argv[3:]]))
+            return
         if action == 'list':
             print(json.dumps({'schema_version': 1, 'workspaces': [{'id': hashlib.sha256(os.fsencode(str(root))).hexdigest()[:16], 'name': root.name} for root in workspace_roots()]}, ensure_ascii=True))
             return
         root = resolve_workspace(workspace_id)
-        if action == 'batch_begin':
+        if action in ('git_begin', 'git_apply', 'git_ack_push', 'git_prepare_pull', 'git_ack_pull'):
+            result = git_handoff_remote(root, workspace_id, action, json.load(sys.stdin))
+        elif action == 'batch_begin':
             result = batch_begin(root, workspace_id, json.load(sys.stdin))
         elif action == 'batch_apply':
             result = batch_apply(root, workspace_id, json.load(sys.stdin))
@@ -592,11 +1020,34 @@ def main():
             result = push_one(root, workspace_id, json.load(sys.stdin))
         elif action == 'checkpoint':
             result = checkpoint(root, workspace_id, json.load(sys.stdin))
-        elif action == 'preview':
+        elif action in ('preview', 'git_preview'):
+            if action == 'git_preview':
+                direct_git_directory(root)
             git, entries, exclusions = inspect(root)
-            result = {'schema_version': 1, 'workspace_id': workspace_id, 'source_path': str(root), 'name': root.name, 'git': git, 'entries': entries, 'estimated_files': sum(x['type'] == 'file' for x in entries), 'estimated_bytes': sum(x.get('size', 0) for x in entries), 'exclusions': exclusions, 'excluded_entries': len(exclusions), 'blockers': [], 'limitations': ['Live-tree estimates; pause independent writers during capture.', 'Symlinks, nested repositories and Git attributes are not supported.', 'Git-ignored files, secrets, keys and database files are included; stop database writers or provide a consistent backup.']}
+            _, rules = read_policy(root)
+            affected = {}
+            for item in entries:
+                disposition = relayignore_disposition(item['path'], rules)
+                if disposition != 'transfer': affected[item['path']] = disposition
+            affected.update({path: 'exclude' for path in exclusions})
+            result = {'schema_version': 1, 'workspace_id': workspace_id, 'source_path': str(root), 'name': root.name, 'git': git, 'entries': entries, 'policy_rules': rules, 'policy_dispositions': affected, 'estimated_files': sum(x['type'] == 'file' for x in entries), 'estimated_bytes': sum(x.get('size', 0) for x in entries), 'exclusions': exclusions, 'excluded_entries': len(exclusions), 'blockers': [], 'limitations': ['Live-tree estimates; pause independent writers during capture.', 'Symlinks, nested repositories and Git attributes are not supported.', 'Git-ignored files, secrets, keys and database files are included; stop database writers or provide a consistent backup.']}
+        elif action == 'policy':
+            result = {'digest': read_policy(root)[0]}
+        elif action == 'git_capture':
+            request = json.load(sys.stdin)
+            with turn_lock(workspace_id):
+                direct_git_directory(root)
+                _push_assert_idle(root)
+                against = request.get('against')
+                if against:
+                    current = checkpoint(root, workspace_id, {'action': 'get', 'endpoint': against['endpoint']})
+                    if current != {'checkpoint': against, 'pending': None}:
+                        error('checkpoint_mismatch', 'The requested delta baseline differs.')
+                manifest, path = capture(root, workspace_id, include_history=request['include_history'], against=against)
+            result = {'manifest': manifest, 'export_path': path}
         elif action == 'capture':
-            manifest, path = capture(root, workspace_id)
+            with turn_lock(workspace_id):
+                manifest, path = capture(root, workspace_id)
             result = {'manifest': manifest, 'export_path': path}
         else: error('invalid_request', 'Unknown operation.')
         print(json.dumps(result, ensure_ascii=True))

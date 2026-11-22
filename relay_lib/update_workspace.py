@@ -50,7 +50,8 @@ def pair_import(state, write_json):
         current = json.loads(path.read_text())
         if current.get('checkpoint_id') == manifest['transfer_id']: return
         raise ValueError('A different pairing already exists for this destination; recovery required.')
-    write_json(path, {'schema_version': 1, 'installation_id': installation_id(write_json),
+    version = 1 if manifest['git']['mode'] == 'plain' else 2
+    write_json(path, {'schema_version': version, 'checkpoint_schema': version, 'installation_id': installation_id(write_json),
         'workspace_id': manifest['workspace_id'], 'vm': state['vm'], 'destination': str(dest),
         'source_path': manifest['source_path'], 'checkpoint_id': manifest['transfer_id'],
         'parent_id': None, 'acknowledgment': 'pending', 'git': manifest['git'], 'entries': manifest['entries'],
@@ -102,7 +103,10 @@ def endpoint(pair):
 
 
 def cp(pair, manifest=None):
-    return {'schema_version': 1, 'workspace_id': pair['workspace_id'], 'endpoint': endpoint(pair),
+    version = pair.get('checkpoint_schema', 1)
+    if manifest is not None:
+        version = manifest.get('checkpoint_schema', version)
+    return {'schema_version': version, 'workspace_id': pair['workspace_id'], 'endpoint': endpoint(pair),
             'source_path': pair['source_path'], 'generation': pair.get('generation', 0) + (1 if manifest else 0),
             'parent_id': pair['checkpoint_id'] if manifest else pair.get('parent_id'),
             'transfer_id': manifest['transfer_id'] if manifest else pair['checkpoint_id'],
@@ -125,7 +129,13 @@ def excluded_snapshot(root, exclusions):
     for relative in exclusions:
         if not relative or relative.startswith('/') or any(p in ('', '.', '..') for p in relative.split('/')): raise ValueError('Invalid excluded path.')
         source = root / relative
-        if source.is_symlink() or not source.is_dir(): raise ValueError('UNSUPPORTED: excluded paths must be regular directories.')
+        st = source.lstat()
+        if stat.S_ISREG(st.st_mode):
+            output.append({'path': relative, 'type': 'file', 'mode': stat.S_IMODE(st.st_mode) & 0o777,
+                           'size': st.st_size, 'sha256': export_workspace.sha(source)})
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            raise ValueError('UNSUPPORTED: excluded paths must be regular files or directories.')
         for current, dirs, files in os.walk(source, followlinks=False, onerror=lambda exc: (_ for _ in ()).throw(exc)):
             dirs.sort(); files.sort()
             directory = Path(current)
@@ -162,16 +172,28 @@ def run(args, importer):
         if (pair['installation_id'] != installation_id(importer.write_json_atomic) or pair['destination'] != str(dest)
                 or pair['workspace_id'] != args.workspace or pair['vm'] != args.vm):
             raise ValueError('Pairing identity, workspace or VM does not match.')
+        if pairfile.with_suffix('.merge-pending.json').exists(): raise ValueError('RECOVERY_REQUIRED: a merge is pending.')
         pending = pairfile.with_suffix('.pending.json')
         if pending.exists(): raise ValueError('RECOVERY_REQUIRED: inspect or resume the pending update: ' + str(pending))
         if pairfile.with_suffix('.push-pending.json').exists(): raise ValueError('RECOVERY_REQUIRED: a push is pending for this destination.')
         if pair['git']['mode'] != 'plain':
-            raise ValueError('UNSUPPORTED: repeat updates of Git workspaces are not yet supported; Git metadata will not be replaced.')
+            from relay_lib import git_handoff
+            return git_handoff.start(args, importer, dest, pairfile, pair, 'pull')
+        if args.commit or args.expect:
+            raise ValueError('--commit and --expect require a Git pairing.')
         local_git, local_entries, local_exclusions = snapshot(dest)
         ssh, host = importer.ssh_command(args.vm)
         preview = importer.remote(ssh, host, args.workspace, 'preview')
         if preview['source_path'] != pair['source_path'] or preview['git']['mode'] != 'plain':
             raise ValueError('UNSUPPORTED: source identity or Git state changed.')
+        policies = {'checkpoint': pair['git'].get('policy_digest'), 'local': local_git.get('policy_digest'),
+                    'vm': preview['git'].get('policy_digest')}
+        if len(set(policies.values())) != 1:
+            message = 'POLICY_MISMATCH: match the checkpoint policy or import into a new folder.'
+            if args.dry_run:
+                print(json.dumps({'status': 'BLOCKED', 'policy': policies, 'blockers': [message]}))
+                return 0
+            raise ValueError(message)
         if local_git != pair['git']:
             raise ValueError('CONFLICT: local workspace Git state changed; no files changed.')
         local = changes(pair['entries'], local_entries)
@@ -252,7 +274,10 @@ def finish(op, pending, importer, as_json):
             source = dest / rel; target = candidate / rel
             if target.exists() or target.is_symlink(): raise ValueError('CONFLICT: excluded local directory collides with candidate.')
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(source, target, copy_function=shutil.copy2)
+            if source.is_dir():
+                shutil.copytree(source, target, copy_function=shutil.copy2)
+            else:
+                shutil.copy2(source, target, follow_symlinks=False)
         verify_with_preserved(candidate, manifest, excluded_paths, excluded_fingerprint, importer)
         if excluded_snapshot(dest, excluded_paths) != excluded_fingerprint: raise ValueError('BUSY: local excluded data changed while copying.')
         sync_tree(candidate); sync_directory(staging)
@@ -315,6 +340,9 @@ def resume(args, importer):
             print(json.dumps(receipt, ensure_ascii=True)); return 0
         op = json.loads(path.read_text())
         if op['destination'] != str(dest) or op['vm'] != args.vm or op['pairing'] != str(pairing_path(dest)): raise ValueError('Transfer identity mismatch.')
+        if op.get('kind') == 'git':
+            from relay_lib import git_handoff
+            return git_handoff.finish(op, path, importer, args.json)
         if op['phase'] == 'acknowledged':
             pair = json.loads(Path(op['pairing']).read_text())
             verify_with_preserved(dest, op['manifest'], op.get('excluded_paths', []), op.get('excluded_fingerprint', []), importer)
@@ -358,6 +386,23 @@ def manage(args, importer):
         except BlockingIOError: raise ValueError('BUSY: another transfer holds the pairing lock.')
         op = json.loads(path.read_text()); base = op['base']; manifest = op['manifest']
         if op['destination'] != str(dest) or op['vm'] != args.vm or op['pairing'] != str(pairfile): raise ValueError('Transfer identity mismatch.')
+        if op.get('kind') == 'git' and args.abort_update:
+            staging = Path(op['staging'])
+            if (staging.is_symlink() or staging.parent != dest.parent or
+                    not staging.name.startswith('.relay-update-') or
+                    (staging / 'publication' / 'journal.json').exists()):
+                raise ValueError('Publication may have started. Inspect and resume the Git handoff.')
+            git, entries, _ = snapshot(dest)
+            if git != base['git'] or entries != base['entries']:
+                raise ValueError('Destination changed. Preserve the staging folder for recovery.')
+            current = remote_cp(importer, args.vm, base, 'get')
+            if current['checkpoint'] != op['prior'] or current['pending'] not in (None, op['proposed']):
+                raise ValueError('Remote checkpoint differs. Inspect and resume the Git handoff.')
+            remote_cp(importer, args.vm, base, 'abort', transfer_id=manifest['transfer_id'])
+            archive = path.with_name(manifest['transfer_id'] + '.aborted.json')
+            os.replace(path, archive)
+            print(json.dumps({'status': 'ABORTED', 'staging': op['staging'], 'journal': str(archive)}))
+            return 0
         if args.inspect_update:
             try:
                 remote = remote_cp(importer, args.vm, base, 'get')

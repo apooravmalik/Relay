@@ -49,3 +49,15 @@ def build_plan(base_entries, local_entries, remote_entries):
     return {'local_changes': local_changes, 'cloud_changes': remote_changes, 'conflicts': conflicts,
             'files': files, 'estimated_bytes': sum(f['size'] for f in files if f['type'] == 'file' and f['action'] != 'deleted'),
             'status': 'CONFLICT' if conflicts else 'BOTH_CHANGED' if local_changes and remote_changes else 'LOCAL_AHEAD' if local_changes else 'CLOUD_AHEAD' if remote_changes else 'IN_SYNC'}
+
+
+def git_state_changes(base, local, remote):
+    """Describe index and HEAD changes without reading or exposing blob contents."""
+    def compare(current):
+        old = {item['path']: item for item in base.get('index', [])}
+        new = {item['path']: item for item in current.get('index', [])}
+        return {'index_changes': _changes(old, new),
+                'head_changed': current.get('head') != base.get('head'),
+                'branch_changed': current.get('branch') != base.get('branch'),
+                'object_format_changed': current.get('object_format') != base.get('object_format')}
+    return {'local_git_state': compare(local), 'cloud_git_state': compare(remote)}

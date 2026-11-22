@@ -152,6 +152,29 @@ test('workspace file browser lists safe visible files and cannot escape the work
   await assert.rejects(() => workspaceBrowseFile(root, '../outside.txt'), /Invalid directory path/);
 });
 
+test('sensitive file previews cannot be accessed through an in-workspace symlink', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'relay-sensitive-alias-'));
+  await run('git', ['init', root]);
+  await writeFile(path.join(root, '.env'), 'SECRET=private\n');
+  await symlink('.env', path.join(root, 'alias.txt'));
+  assert.equal((await listWorkspaceFiles(root)).entries.some((entry) => entry.name === 'alias.txt'), false);
+  await assert.rejects(() => workspaceBrowseFile(root, 'alias.txt'), /Sensitive files/);
+  await assert.rejects(() => workspaceFile(root, 'alias.txt'), /Sensitive files/);
+});
+
+test('renaming a sensitive tracked file does not expose its contents through a diff', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'relay-sensitive-rename-'));
+  await run('git', ['init', root]);
+  await run('git', ['-C', root, 'config', 'user.email', 'relay-test@example.invalid']);
+  await run('git', ['-C', root, 'config', 'user.name', 'Relay Test']);
+  await writeFile(path.join(root, '.env'), 'SECRET=private\n');
+  await run('git', ['-C', root, 'add', '.env']);
+  await run('git', ['-C', root, 'commit', '-m', 'base']);
+  await run('git', ['-C', root, 'mv', '.env', 'config.txt']);
+  assert.equal((await workspaceChanges(root)).find((entry) => entry.path === 'config.txt').previewAllowed, false);
+  await assert.rejects(() => workspaceDiff(root, 'config.txt'), /not available for preview/);
+});
+
 test('folder creation stays inside the VM root, skips hidden folders, and does not initialize Git', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'relay-project-root-'));
   const outside = await mkdtemp(path.join(tmpdir(), 'relay-outside-root-'));
@@ -174,3 +197,20 @@ test('folder creation stays inside the VM root, skips hidden folders, and does n
   assert.equal(registered.name, 'existing');
 });
 
+
+test('workspace transfer rules hide custom protected and excluded files from Relay previews', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'relay-policy-preview-'));
+  await writeFile(path.join(root, '.relayignore'), 'protect private.txt\nexclude scratch/**\n');
+  await writeFile(path.join(root, 'private.txt'), 'DUMMY_PRIVATE');
+  await mkdir(path.join(root, 'scratch'));
+  await writeFile(path.join(root, 'scratch', 'data.txt'), 'DUMMY_EXCLUDED');
+  await writeFile(path.join(root, 'public.txt'), 'OK');
+  await run('git', ['-C', root, 'init', '-q']);
+  assert.deepEqual((await listWorkspaceFiles(root)).entries.map(({ name }) => name), ['public.txt']);
+  await assert.rejects(workspaceBrowseFile(root, 'private.txt'), /not available/);
+  await assert.rejects(workspaceBrowseFile(root, 'scratch/data.txt'), /not available/);
+  const changes = await workspaceChanges(root);
+  assert.equal(changes.find(({ path }) => path === 'private.txt').previewAllowed, false);
+  assert.equal(changes.find(({ path }) => path === 'public.txt').previewAllowed, true);
+  assert.equal((await workspaceBrowseFile(root, 'public.txt')).content, 'OK');
+});
