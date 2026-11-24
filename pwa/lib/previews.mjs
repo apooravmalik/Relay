@@ -59,3 +59,10 @@ export function createPreviewManager({ run = execFileAsync, wait = sleep, attemp
 const previews = createPreviewManager();
 export const openPreview = (port) => previews.open(port);
 export const stopPreview = (port) => previews.stop(port);
+export async function assertPreviewAvailable(port) {
+  const { stdout } = await execFileAsync('tailscale', ['serve', 'status', '--json'], { timeout: 3000, maxBuffer: 1024 * 1024 });
+  const config = JSON.parse(stdout);
+  if (config.TCP?.[String(port)] || Object.keys(config.Web || {}).some((host) => host.endsWith(`:${port}`))) {
+    throw new Error('This port already has a private publication. It will not be replaced by this session.');
+  }
+}

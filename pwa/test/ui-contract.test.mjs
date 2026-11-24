@@ -18,12 +18,13 @@ test('chat UI bounds scrolling and prevents concurrent sends', () => {
   assert.match(app, /if \(state\.busy \|\| \(!message && !state\.attachment\) \|\| !state\.conversation\) return/);
   assert.match(app, /Math\.max\(prompt\.scrollHeight, 22\)/);
   assert.match(app, /setBusy\(true\)/);
-  assert.match(app, /finally \{\s*setBusy\(false\);\s*\}/s);
+  assert.match(app, /followSession/);
+  assert.match(app, /detachSession/);
 });
 
 test('PWA markup versions its UI assets after a controller deployment', () => {
-  assert.match(markup, /styles\.css\?v=mobile-reconcile-1/);
-  assert.match(markup, /app\.js\?v=mobile-reconcile-1/);
+  assert.match(markup, /styles\.css\?v=sessions-v14-1/);
+  assert.match(markup, /app\.js\?v=sessions-v14-1/);
 });
 
 test('chat messages render safe Markdown instead of raw HTML text', () => {
@@ -81,7 +82,7 @@ test('chat controls expose working feedback, concise reasoning summaries, and a 
   assert.match(markup, /id="git-status"/);
   assert.match(app, /Codex is working/);
   assert.match(app, /reasoning/);
-  assert.match(app, /turns\/stop/);
+  assert.match(app, /sessions\/\$\{state\.session\.id\}\/stop/);
   assert.match(app, /Edit & resend/);
   assert.match(stylesheet, /\.working-dots\s*\{[^}]*display:\s*inline-flex/s);
 });

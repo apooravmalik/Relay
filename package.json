@@ -5,6 +5,8 @@
   "scripts": {
     "pwa:dev": "node pwa/server.mjs",
     "test": "node --test pwa/test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22.18.0 <23"
   }
 }
-

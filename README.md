@@ -1,5 +1,13 @@
 # Relay V0 prototype
 
+
+The V1.4 persistent-session implementation is available in this checkout. It adds
+server-owned turns, reconnect/replay, explicit Stop and guarded recovery. It is
+**not deployed or release-accepted**: the live service needs cgroup delegation,
+and real Codex/phone/paired-desktop acceptance remains pending. See the
+[deployment and recovery guide](RELAY_V1_4_DEPLOYMENT.md) and
+[V1.4 verification record](CURRENT_PROGRESS_VM.md).
+
 Relay is a private, single-owner prototype for working on VM workspaces from a
 phone and transferring them to or from a PC. Its CLI supports an initial Git
 push and legacy patch return, as well as a separate first import of a VM-created

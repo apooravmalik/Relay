@@ -1,5 +1,7 @@
 """Remote, read-only workspace capture helper, executed by the local CLI over SSH."""
 import hashlib
+import sqlite3
+from contextlib import contextmanager
 import fnmatch
 import fcntl
 import json
@@ -578,16 +580,52 @@ def _batch_directory(transfer):
     return root / transfer
 
 
-def turn_lock(workspace_id):
-    path = Path.home() / '.relay-v0' / 'controller' / 'handoff-locks' / (workspace_id + '.lock')
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    lock = path.open('a')
+_turn_locks = {}
+
+
+def assert_session_idle(workspace_id):
+    controller = Path(os.environ.get('RELAY_CONTROLLER_STATE_DIR', Path.home() / '.relay-v0/controller'))
+    directory = controller / 'sessions'
+    database, marker = directory / 'sessions.sqlite', directory / 'initialized'
+    required = controller / 'sessions-required'
+    if not database.exists() and not marker.exists() and not required.exists():
+        return  # Legacy installation, before durable sessions are initialized.
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        lock.close()
-        error('source_busy', 'A Relay chat turn or workspace handoff is active.')
-    return lock
+        if database.is_symlink() or not database.is_file() or marker.read_text() != '1\n':
+            raise ValueError('Missing or invalid initialized store.')
+        with sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True, timeout=2) as connection:
+            if connection.execute('PRAGMA user_version').fetchone()[0] != 1:
+                raise ValueError('Unsupported session schema.')
+            guard = connection.execute('SELECT session_id FROM workspace_guards WHERE workspace_id=?', (workspace_id,)).fetchone()
+            active = connection.execute("SELECT id FROM sessions WHERE workspace_id=? AND state NOT IN ('COMPLETED','FAILED','INTERRUPTED')", (workspace_id,)).fetchone()
+            if guard or active:
+                error('source_busy', 'Relay execution is active or uncertain. Stop or recover the session before handoff.')
+    except RuntimeError:
+        raise
+    except Exception:
+        error('source_busy', 'Session storage cannot be verified. Restore or recover it before handoff.')
+
+
+@contextmanager
+def turn_lock(workspace_id):
+    # A remote action may call capture/checkpoint helpers in the same process.
+    if workspace_id in _turn_locks:
+        yield _turn_locks[workspace_id]
+        return
+    controller = Path(os.environ.get('RELAY_CONTROLLER_STATE_DIR', Path.home() / '.relay-v0/controller'))
+    lock_path = controller / 'handoff-locks' / (workspace_id + '.lock')
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with lock_path.open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            error('source_busy', 'A Relay chat turn or workspace handoff is active.')
+        assert_session_idle(workspace_id)
+        _turn_locks[workspace_id] = lock
+        try:
+            yield lock
+        finally:
+            del _turn_locks[workspace_id]
 
 
 def _batch_lock(workspace_id):
@@ -995,6 +1033,25 @@ def git_handoff_remote(root, workspace_id, action, request):
             else:
                 checkpoint(root, workspace_id, dict(identity, action='commit', transfer_id=transfer))
         return {'status': 'SUCCESS', 'checkpoint': proposed, 'recovery_path': str(directory) if pushing else None}
+
+
+def _guarded(function):
+    def guarded(root, workspace_id, *args, **kwargs):
+        with turn_lock(workspace_id):
+            return function(root, workspace_id, *args, **kwargs)
+    return guarded
+
+
+for _name in ('capture', 'push_one', 'batch_begin', 'batch_apply', 'git_handoff_remote', 'export_manifest'):
+    globals()[_name] = _guarded(globals()[_name])
+
+_original_checkpoint = checkpoint
+
+def checkpoint(root, workspace_id, request):
+    if request.get('action') == 'get':
+        return _original_checkpoint(root, workspace_id, request)
+    with turn_lock(workspace_id):
+        return _original_checkpoint(root, workspace_id, request)
 
 
 def main():

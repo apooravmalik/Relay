@@ -1,4 +1,5 @@
 import { localPreviewPorts } from './local-preview.js';
+import { followSession, finishedStates } from './session-client.js';
 import { renderMarkdown } from './markdown.js';
 
 const homeScreen = document.querySelector('#home-screen');
@@ -30,7 +31,7 @@ const previewPort = document.querySelector('#preview-port');
 const previewStatus = document.querySelector('#preview-status');
 const previewLink = document.querySelector('#preview-link');
 
-const state = { attachment: null, busy: false, changes: [], conversation: null, fileDirectories: new Map(), filesLoaded: false, models: [], preview: null, projectRoot: null, projectPath: '', turnStatus: null, voiceSupported: false, workspace: null };
+const state = { pendingStart: null, session: null, feed: null, view: 0, sessions: [], previewAttempts: new Set(), attachment: null, busy: false, changes: [], conversation: null, fileDirectories: new Map(), filesLoaded: false, models: [], preview: null, projectRoot: null, projectPath: '', turnStatus: null, voiceSupported: false, workspace: null };
 
 function element(name, className, text) {
   const node = document.createElement(name);
@@ -43,7 +44,9 @@ async function api(url, options) {
   const response = await fetch(url, { headers: { Accept: 'application/json', ...(options?.headers || {}) }, ...options });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
-    throw new Error(body.error || 'Relay controller is unavailable.');
+    const error = new Error(body.error || 'Relay controller is unavailable.');
+    error.status = response.status;
+    throw error;
   }
   return response.status === 204 ? null : response.json();
 }
@@ -356,10 +359,14 @@ function conversationRow(conversation) {
 }
 
 async function loadWorkspaceData() {
-  const [conversations, changes] = await Promise.all([
+  const workspaceId = state.workspace.id;
+  const [conversations, changes, sessions] = await Promise.all([
     api(`/api/workspaces/${state.workspace.id}/conversations`),
     api(`/api/workspaces/${state.workspace.id}/changes`),
+    api(`/api/workspaces/${state.workspace.id}/sessions`),
   ]);
+  if (state.workspace?.id !== workspaceId) return;
+  state.sessions = sessions.sessions;
   state.changes = changes.changes;
   document.querySelector('#change-count').textContent = state.changes.length ? String(state.changes.length) : '';
   document.querySelector('#review-count').textContent = `${state.changes.length} file${state.changes.length === 1 ? '' : 's'} changed`;
@@ -367,6 +374,10 @@ async function loadWorkspaceData() {
   conversationList.replaceChildren(...(conversations.conversations.length
     ? conversations.conversations.map(conversationRow)
     : [element('p', 'empty', 'No Relay conversations yet. Start one when you are ready.')]));
+  for (const session of state.sessions.filter((candidate) => !finishedStates.has(candidate.state))) {
+    const row = element('button', 'conversation-row session-row', `${session.state === 'UNCERTAIN' ? 'Needs recovery' : 'Task running'} · ${session.id.slice(0, 8)}`);
+    row.type = 'button'; row.addEventListener('click', () => openSession(session)); conversationList.prepend(row);
+  }
   changesList.replaceChildren(...(state.changes.length
     ? state.changes.map(changeRow)
     : [element('p', 'empty', state.workspace.gitAvailable ? 'No changed files on this VM.' : 'Initialize Git in Codex to view Relay changes and handoffs.')]));
@@ -385,6 +396,7 @@ function changeRow(change) {
 }
 
 async function openWorkspace(workspace) {
+  detachSession();
   state.workspace = workspace;
   state.attachment = null;
   renderAttachment();
@@ -423,7 +435,7 @@ async function createPreview(event) {
   previewLink.hidden = true;
   try {
     const { preview } = await api(`/api/workspaces/${state.workspace.id}/preview`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ port: previewPort.value }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ port: previewPort.value, sessionId: state.session?.id }),
     });
     showPreview(preview);
   } catch (error) {
@@ -485,11 +497,13 @@ function appendPreviewLink(preview) {
 
 async function publishDetectedPreviews(text) {
   for (const port of localPreviewPorts(text)) {
+    if (!state.session || finishedStates.has(state.session.state) || state.session.state === 'UNCERTAIN' || state.previewAttempts.has(port)) continue;
+    state.previewAttempts.add(port);
     try {
       const { preview } = await api(`/api/workspaces/${state.workspace.id}/preview`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ port }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ port, sessionId: state.session?.id }),
       });
-      appendPreviewLink(preview);
+      // The persisted preview event renders the link once for every subscriber.
     } catch (error) {
       appendMessage('system', `Preview for localhost:${port} is unavailable: ${error.message}`);
     }
@@ -504,7 +518,7 @@ async function openChatPreview(event) {
   const previewWindow = window.open('', '_blank');
   try {
     const { preview } = await api(`/api/workspaces/${state.workspace.id}/preview`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ port }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ port, sessionId: state.session?.id }),
     });
     showPreview(preview);
     if (previewWindow) previewWindow.location.replace(preview.url);
@@ -568,9 +582,8 @@ function setBusy(busy) {
   uploadInput.disabled = busy;
   stopTurn.hidden = !busy;
   stopTurn.disabled = false;
-  for (const selector of ['#back-home', '#back-to-chats', '#chats-tab', '#changes-tab', '#files-tab', '#review-changes', '#hide-chat']) {
-    document.querySelector(selector).disabled = busy;
-  }
+  // Navigation is available while a server-owned task runs.
+  document.querySelector('#hide-chat').disabled = false;
   if (state.voiceSupported) document.querySelector('#voice-button').disabled = busy;
 }
 
@@ -605,6 +618,12 @@ async function uploadAttachment() {
 }
 
 async function openConversation(conversation) {
+  detachSession();
+  if (conversation.id) {
+    const result = await api(`/api/workspaces/${state.workspace.id}/sessions`);
+    const latest = result.sessions.find((session) => session.threadId === conversation.id);
+    if (latest) return openSession(latest);
+  }
   state.conversation = conversation;
   conversationPanel.hidden = true;
   chatPanel.hidden = false;
@@ -646,83 +665,132 @@ async function createConversation() {
   }
 }
 
-function handleSseChunk(chunk, assistant) {
-  const event = /event: ([^\n]+)/.exec(chunk)?.[1];
-  const data = /data: (.*)/.exec(chunk)?.[1];
-  if (!event || !data) return false;
-  const payload = JSON.parse(data);
-  if (event === 'delta') appendAssistantDelta(assistant, payload.text);
-  if (event === 'reasoning') appendReasoningSummary(assistant, payload.text);
-  if (event === 'conversation') {
-    state.conversation = payload.conversation;
-    document.querySelector('#chat-title').textContent = payload.conversation.name;
-    document.querySelector('#hide-chat').hidden = false;
+function detachSession() {
+  state.feed?.abort(); state.feed = null; state.view += 1; state.session = null;
+  setBusy(false);
+  document.querySelector('#session-recovery').hidden = true;
+}
+
+function sessionStatus() {
+  const session = state.session;
+  if (!session) return;
+  const labels = { STARTING: 'Starting on VM…', RUNNING: 'Working on VM…', CANCEL_REQUESTED: 'Stopping…', COMPLETED: 'Completed', INTERRUPTED: 'Stopped', FAILED: 'Failed', UNCERTAIN: 'Execution uncertain — recovery required' };
+  document.querySelector('#chat-status').textContent = session.phase === 'finishing' ? 'Finishing and stopping task servers…' : labels[session.state];
+  setBusy(!finishedStates.has(session.state));
+  stopTurn.hidden = finishedStates.has(session.state) || session.state === 'UNCERTAIN';
+  stopTurn.disabled = session.state === 'CANCEL_REQUESTED' || session.phase === 'finishing';
+  document.querySelector('#session-recovery').hidden = session.state !== 'UNCERTAIN';
+  document.querySelector('#recovery-message').textContent = session.reason || 'Relay cannot prove this task stopped. New tasks and handoffs are blocked.';
+}
+
+async function openSession(selected) {
+  detachSession();
+  setBusy(true);
+  const view = state.view, workspaceId = state.workspace.id;
+  const { session } = await api(`/api/workspaces/${workspaceId}/sessions/${selected.id}`);
+  if (view !== state.view) return;
+  state.session = session; state.previewAttempts = new Set();
+  state.conversation = { id: session.threadId, name: 'VM session' };
+  conversationPanel.hidden = true; chatPanel.hidden = false; changesPanel.hidden = true; filesPanel.hidden = true;
+  document.querySelector('#chat-title').textContent = 'VM session';
+  document.querySelector('#hide-chat').hidden = !session.threadId;
+  messageList.replaceChildren();
+  try { localStorage.setItem('relay-session-selection', JSON.stringify({ workspaceId, sessionId: session.id })); } catch {}
+  await loadModels();
+  if (view !== state.view) return;
+  if (session.model) { modelSelect.value = session.model; populateEfforts(); if (session.effort) effortSelect.value = session.effort; }
+  if (session.threadId) {
+    try {
+      const history = await api(`/api/workspaces/${workspaceId}/conversations/${session.threadId}`);
+      if (view !== state.view) return;
+      state.conversation = history.conversation;
+      document.querySelector('#chat-title').textContent = history.conversation.name;
+      for (const message of history.messages) {
+        if (!session.eventsExpired && message.turnId && message.turnId === session.turnId) continue;
+        const content = appendMessage(message.role, message.text);
+        if (message.turnId) content.closest('article').dataset.historyTurn = message.turnId;
+      }
+    } catch { if (view === state.view) appendMessage('system', 'Saved history could not be loaded. Session output is available below.'); }
   }
-  if (event === 'approval') appendMessage('system', 'Relay declined an unexpected interactive approval request. Standard Codex commands run with full VM access.');
-  if (event === 'error') throw new Error(payload.message || 'Codex could not complete the turn.');
-  if (event === 'completed') state.turnStatus = payload.status || 'completed';
-  return event === 'completed';
+  if (view !== state.view) return;
+  sessionStatus();
+  if (session.eventsExpired) { appendMessage('system', 'Detailed session events expired; saved Codex history is shown.'); return; }
+  const originallyFinished = finishedStates.has(session.state) || session.state === 'UNCERTAIN';
+  const assistants = new Map(), renderedPreviews = new Set();
+  const abort = new AbortController(); state.feed = abort;
+  void followSession(`/api/workspaces/${workspaceId}/sessions/${session.id}/events`, {
+    signal: abort.signal,
+    onConnection(connected) { if (view === state.view) { if (connected) sessionStatus(); else document.querySelector('#chat-status').textContent = 'Reconnecting… Task status will refresh from the VM.'; } },
+    onEvent(event) {
+      if (view !== state.view) return;
+      state.session.generation = event.id; state.session.lastEventId = event.id;
+      if (event.type === 'input') appendMessage('user', event.text);
+      if (event.type === 'conversation') {
+        state.conversation = event.conversation; state.session.threadId = event.conversation.id;
+        document.querySelector('#chat-title').textContent = event.conversation.name;
+        document.querySelector('#hide-chat').hidden = false;
+      }
+      if (event.type === 'turn') {
+        state.session.turnId = event.turnId;
+        for (const node of messageList.querySelectorAll('[data-history-turn]')) if (node.dataset.historyTurn === event.turnId) node.remove();
+      }
+      if (event.type === 'delta' || event.type === 'reasoning') {
+        const key = event.itemId || 'assistant';
+        if (!assistants.has(key)) assistants.set(key, appendWorkingMessage());
+        const assistant = assistants.get(key);
+        if (event.type === 'delta') {
+          appendAssistantDelta(assistant, event.text);
+          if (!originallyFinished) void publishDetectedPreviews(assistant.content.dataset.markdown || '');
+        } else appendReasoningSummary(assistant, event.text);
+      }
+      if (event.type === 'preview' && !renderedPreviews.has(event.port)) { renderedPreviews.add(event.port); appendPreviewLink(event); }
+      if (event.type === 'phase') state.session.phase = event.phase;
+      if (event.type === 'status') {
+        // Replaying old statuses must not republish a terminal session's previews.
+        state.session = { ...state.session, state: event.state, phase: event.phase, reason: event.reason };
+        if (finishedStates.has(event.state) || event.state === 'UNCERTAIN') {
+          for (const assistant of assistants.values()) if (assistant.content.dataset.waiting) { assistant.content.textContent = event.state === 'INTERRUPTED' ? 'Stopped.' : ''; delete assistant.content.dataset.waiting; }
+          for (const link of messageList.querySelectorAll('.preview-open')) { link.removeAttribute('href'); link.textContent = 'Task preview ended'; }
+          void loadWorkspaceData().catch(() => {});
+        }
+      }
+      sessionStatus();
+    },
+  }).catch((error) => { if (view === state.view) { appendMessage('system', error.message); document.querySelector('#chat-status').textContent = 'Session connection needs attention'; } });
 }
 
 async function sendPrompt(event) {
   event.preventDefault();
   const message = prompt.value.trim();
   if (state.busy || (!message && !state.attachment) || !state.conversation) return;
-  let assistant;
-  state.turnStatus = null;
   setBusy(true);
+  let body, workspaceId = state.workspace.id;
   try {
     const upload = await uploadAttachment();
-    const text = upload
-      ? `${message || 'Please inspect the uploaded file.'}\n\nUploaded file: ${upload.path}`
-      : message;
-    prompt.value = '';
-    resizePrompt();
-    state.attachment = null;
-    uploadInput.value = '';
-    renderAttachment();
-    appendMessage('user', text);
-    assistant = appendWorkingMessage();
-    document.querySelector('#chat-status').textContent = 'Working on VM…';
-    const turnPath = state.conversation.id
-      ? `/api/workspaces/${state.workspace.id}/conversations/${state.conversation.id}/turns`
-      : `/api/workspaces/${state.workspace.id}/conversations/turns`;
+    const text = upload ? `${message || 'Please inspect the uploaded file.'}\n\nUploaded file: ${upload.path}` : message;
     const selection = { model: modelSelect.value || undefined, effort: effortSelect.value || undefined };
-    const response = await fetch(turnPath, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-      body: JSON.stringify({ text, ...selection }),
-    });
-    if (!response.ok || !response.body) throw new Error((await response.json().catch(() => ({}))).error || 'Could not start Codex.');
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let complete = false;
-    while (!complete) {
-      const { done, value } = await reader.read();
-      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
-      let boundary;
-      while ((boundary = buffer.indexOf('\n\n')) >= 0) complete ||= handleSseChunk(buffer.slice(0, boundary), assistant), buffer = buffer.slice(boundary + 2);
-      if (done) break;
-    }
-    if (!complete) throw new Error('Connection interrupted. Check the saved conversation before sending again.');
-    if (!assistant.content.textContent.trim() || assistant.content.dataset.waiting) {
-      if (state.turnStatus === 'interrupted') {
-        assistant.content.textContent = 'Stopped.';
-        delete assistant.content.dataset.waiting;
-      } else if (!assistant.reasoning.textContent) assistant.message.remove();
-    }
-    document.querySelector('#chat-status').textContent = state.turnStatus === 'interrupted' ? 'Stopped' : 'Saved on VM';
-    if (state.turnStatus === 'completed') await publishDetectedPreviews(assistant.content.dataset.markdown || assistant.content.textContent);
-    await Promise.all([refreshWorkspaceMetadata(), loadWorkspaceData()]).catch(() => {});
+    const pending = state.pendingStart?.workspaceId === workspaceId ? state.pendingStart : null;
+    body = { text, ...selection, threadId: state.conversation.id || undefined, idempotencyKey: pending?.idempotencyKey || crypto.randomUUID(), createdAt: pending?.createdAt || Date.now() };
+    state.pendingStart = { workspaceId, idempotencyKey: body.idempotencyKey, createdAt: body.createdAt };
+    try { localStorage.setItem('relay-pending-start', JSON.stringify(state.pendingStart)); } catch {}
+    const { session } = await api(`/api/workspaces/${workspaceId}/sessions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    state.pendingStart = null; try { localStorage.removeItem('relay-pending-start'); } catch {}
+    prompt.value = ''; resizePrompt(); state.attachment = null; uploadInput.value = ''; renderAttachment();
+    await openSession(session);
   } catch (error) {
-    if (assistant?.content.dataset.waiting) {
-      if (assistant.reasoning.textContent) assistant.content.textContent = 'Response interrupted.';
-      else assistant.message.remove();
+    // A lost start response is resolved by discovery, never a fresh POST/key.
+    if (body) {
+      try {
+        const result = await api(`/api/workspaces/${workspaceId}/sessions`);
+        const latest = result.sessions.find((session) => session.requestKey === body.idempotencyKey);
+        if (latest) { state.pendingStart = null; try { localStorage.removeItem('relay-pending-start'); } catch {} await openSession(latest); return; }
+      } catch {}
     }
-    appendMessage('system', error.message);
-    document.querySelector('#chat-status').textContent = 'Needs attention';
-  } finally {
+    if (error.status === 410) {
+      state.pendingStart = null;
+      try { localStorage.removeItem('relay-pending-start'); } catch {}
+    }
+    appendMessage('system', `${error.message} Review saved sessions before sending again.`);
     setBusy(false);
   }
 }
@@ -802,6 +870,8 @@ function setupVoice() {
 }
 
 document.querySelector('#back-home').addEventListener('click', () => {
+  detachSession();
+  try { localStorage.removeItem('relay-session-selection'); } catch {}
   workspaceScreen.hidden = true;
   homeScreen.hidden = false;
   loadHome();
@@ -864,6 +934,7 @@ document.querySelector('#open-model-settings').addEventListener('click', () => {
 document.querySelector('#close-model-settings').addEventListener('click', () => modelSettingsDialog.close());
 document.querySelector('#new-chat').addEventListener('click', createConversation);
 document.querySelector('#back-to-chats').addEventListener('click', () => {
+  detachSession();
   state.conversation = null;
   chatPanel.hidden = true;
   conversationPanel.hidden = false;
@@ -886,11 +957,12 @@ document.querySelector('#show-diff').addEventListener('click', () => loadFile('d
 document.querySelector('#show-file').addEventListener('click', () => loadFile('file'));
 messageList.addEventListener('click', openChatPreview);
 stopTurn.addEventListener('click', async () => {
-  if (!state.busy || !state.workspace || !state.conversation?.id) return;
+  if (!state.busy || !state.workspace || !state.session) return;
   stopTurn.disabled = true;
   document.querySelector('#chat-status').textContent = 'Stopping Codex…';
   try {
-    await api(`/api/workspaces/${state.workspace.id}/conversations/${state.conversation.id}/turns/stop`, { method: 'POST' });
+    const { session } = await api(`/api/workspaces/${state.workspace.id}/sessions/${state.session.id}/stop`, { method: 'POST' });
+    state.session = session; sessionStatus();
   } catch (error) {
     stopTurn.disabled = false;
     appendMessage('system', error.message);
@@ -907,4 +979,29 @@ uploadInput.addEventListener('change', () => {
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/service-worker.js');
 setupVoice();
 resizePrompt();
-loadHome();
+loadHome().then(async () => {
+  try {
+    state.pendingStart = JSON.parse(localStorage.getItem('relay-pending-start') || 'null');
+    const selected = JSON.parse(localStorage.getItem('relay-session-selection') || 'null') || (state.pendingStart ? { workspaceId: state.pendingStart.workspaceId } : null);
+    if (!selected) return;
+    const { workspaces } = await api('/api/workspaces');
+    const workspace = workspaces.find((item) => item.id === selected.workspaceId);
+    if (workspace) {
+      await openWorkspace(workspace);
+      if (state.pendingStart?.workspaceId === workspace.id) {
+        const { sessions } = await api(`/api/workspaces/${workspace.id}/sessions`);
+        const accepted = sessions.find((session) => session.requestKey === state.pendingStart.idempotencyKey);
+        if (accepted) { state.pendingStart = null; localStorage.removeItem('relay-pending-start'); await openSession(accepted); return; }
+        conversationList.prepend(element('p', 'status', 'A start response was lost. Retry with the original prompt and settings; Relay will reuse the request key.'));
+      }
+      if (selected.sessionId) await openSession({ id: selected.sessionId });
+    }
+  } catch {}
+});
+for (const [id, action] of [['recover-recheck', 'recheck'], ['recover-terminate', 'terminate']]) document.querySelector(`#${id}`).addEventListener('click', async () => {
+  if (!state.session) return;
+  try {
+    const { session } = await api(`/api/workspaces/${state.workspace.id}/sessions/${state.session.id}/recovery`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, generation: state.session.generation }) });
+    await openSession(session);
+  } catch (error) { document.querySelector('#recovery-message').textContent = error.message; }
+});

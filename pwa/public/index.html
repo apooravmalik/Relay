@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#07111f">
     <meta name="description" content="Relay private workspace controller">
     <link rel="manifest" href="/manifest.webmanifest">
-    <link rel="stylesheet" href="/styles.css?v=mobile-reconcile-1">
+    <link rel="stylesheet" href="/styles.css?v=sessions-v14-1">
     <title>Relay</title>
   </head>
   <body>
@@ -63,6 +63,7 @@
             </div>
             <button id="hide-chat" class="text-button" type="button">Hide</button>
           </div>
+          <div id="session-recovery" class="session-recovery" role="status" hidden><p id="recovery-message"></p><button id="recover-recheck" type="button">Recheck execution</button><button id="recover-terminate" type="button">Terminate owned task and recover</button></div>
           <div id="message-list" class="message-list" aria-label="Conversation messages"></div>
           <button id="review-changes" class="change-summary" type="button">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 2h8l4 4v16H6zM14 2v5h5M9 13h6M9 17h6"/></svg>
@@ -142,6 +143,6 @@
       </form>
       <p id="project-creator-status" class="creator-status" role="status"></p>
     </dialog>
-    <script type="module" src="/app.js?v=mobile-reconcile-1"></script>
+    <script type="module" src="/app.js?v=sessions-v14-1"></script>
   </body>
 </html>

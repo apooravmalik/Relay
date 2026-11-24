@@ -1,6 +1,6 @@
 # Relay — Open Problems and Validation Backlog
 
-**Last reviewed:** 10 November 2026
+**Last reviewed:** 24 November 2026 (V1.4 additions; older entries retain their historical status)
 
 This is the working list of problems found while testing the Mac → VM → phone
 workflow. A problem is closed only after it has reproducible test evidence; a
@@ -221,6 +221,66 @@ export/restore, record versions, and refuse or clearly label unsupported raw
 live database captures.
 
 ## P1 — Phone and PWA reliability
+
+### RLY-022 · Sent messages appear late in the chat
+
+**Status:** Open — reproduced in the V1.4 candidate
+
+On 24 November, two phone-sized Playwright runs measured 1.39–1.54 seconds
+from Send to backend acceptance and 3.04–3.14 seconds until the user's message
+became visible. The UI waits for the start request and session loading before
+rendering the input. Slow requests can leave the user without timely feedback.
+
+**Required fix:** show the sent message and a clear sending state promptly,
+then reconcile it with the persisted session input without duplicates. Preserve
+the existing idempotency key, lost-response recovery, error handling, and
+attachment behavior; never imply acceptance before the server confirms it.
+Also investigate slow workspace/conversation loading on reopen. Measure on the
+real candidate and add deterministic browser tests for slow and failed requests.
+
+**Evidence:** `pwa/test/session-live-playwright.mjs`; a real Codex task resumed
+after browser closure, and 46 backend text events matched both browser views.
+That pass does not establish an acceptable Send latency or physical-phone behavior.
+
+### RLY-023 · V1.4 release-level session and handoff tests remain incomplete
+
+**Status:** Open — candidate and partial browser verification only
+
+The real candidate passed a delegated-cgroup detached-child fixture and a
+phone-sized Chromium close/reopen run with two subscribers, a running heartbeat,
+and matching backend/frontend text. Remaining tests include:
+
+- A physical phone: lock or close for at least two minutes, airplane-mode
+  interruption, reconnect, output replay, and no duplicate prompt or message.
+- Explicit Stop during writes and disconnection; verify termination and bytes,
+  and check handoffs refuse during cancellation and succeed afterward.
+- Paired desktop Git and plain handoffs with the candidate's matching controller
+  state and helper, including active-task refusal and repeat/merge recovery.
+- Dedicated-controller crash, orphaned or detached writer, uncertainty, audited
+  recovery, stale identity, and storage-failure cases with actual cgroups and
+  real Codex. A mocked process driver is not production containment evidence.
+- Preview availability and cleanup on success, failure and Stop; verify unrelated
+  servers remain running. Check authorization, rollout/rollback, backup/restore,
+  resource limits, and the remaining S01–S19 cases at their required layers.
+
+Record the candidate revision, versions, device, session identities, event
+evidence, and receipts without exposing private output. See
+[the V1.4 E2E plan](RELAY_V1_4_SESSION_E2E_TEST_PLAN.md).
+
+### RLY-024 · Candidate workspace registry is shared with the live PWA
+
+**Status:** Open — test-service isolation incomplete
+
+The candidate uses a separate controller state and test workspace root but still
+reads the default live workspace registry. Existing VM workspaces therefore
+appear in its workspace list. Its independent session guards do not coordinate
+with the live controller for those projects.
+
+**Required fix:** give the candidate a separate `RELAY_WORKSPACE_REGISTRY_FILE`,
+verify only disposable workspaces are listed, and use matching candidate state
+for the desktop helper. Drain candidate tasks before changing or restarting its
+service. Do not run both controllers against the same workspace with independent
+guards.
 
 ### RLY-005 · Preview URLs depend on a fragile development-server contract
 

@@ -34,12 +34,12 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     const text = message.params.input[0].text;
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { turn: { id: 'turn-1' } } }) + '\\n');
     if (text === 'hold') return;
-    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'item/reasoning/summaryTextDelta', params: { delta: 'Checking the workspace.' } }) + '\\n');
-    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'turn/completed', params: { turn: { status: 'completed' } } }) + '\\n');
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'item/reasoning/summaryTextDelta', params: { delta: 'Checking the workspace.', threadId: 'thread-1', turnId: 'turn-1', itemId: 'reasoning-1', summaryIndex: 0 } }) + '\\n');
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } }) + '\\n');
     return;
   }
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: {} }) + '\\n');
-  if (message.method === 'turn/interrupt') process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'turn/completed', params: { turn: { status: 'interrupted' } } }) + '\\n');
+  if (message.method === 'turn/interrupt') process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'interrupted' } } }) + '\\n');
 });
 `);
   await chmod(executable, 0o755);
@@ -56,7 +56,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     assert.match(relayVmDeveloperInstructions, /http:\/\/localhost:<port>/);
     assert.deepEqual(requests.find((request) => request.method === 'thread/settings/update').params.effort, 'medium');
     assert.equal(requests.find((request) => request.method === 'thread/settings/update').params.summary, 'concise');
-    assert.deepEqual(events.find((event) => event.type === 'reasoning'), { type: 'reasoning', text: 'Checking the workspace.' });
+    assert.deepEqual(events.find((event) => event.type === 'reasoning'), { type: 'reasoning', text: 'Checking the workspace.', threadId: 'thread-1', turnId: 'turn-1', itemId: 'reasoning-1', summaryIndex: 0 });
 
     await streamTurn({ cwd: '/tmp/project', threadId: 'thread-1', text: 'continue', model: 'gpt-test', effort: 'low', onEvent: () => {} });
     const resumed = (await readFile(output, 'utf8')).trim().split('\n').map(JSON.parse);

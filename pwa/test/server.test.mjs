@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
-import { EventEmitter } from 'node:events';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { FixtureScopes } from './fixtures/session-fixtures.mjs';
 import test from 'node:test';
-import { createRelayServer, interruptOnDisconnect } from '../server.mjs';
+import { createRelayServer } from '../server.mjs';
 
 async function withServer(testBody) {
   const hidden = [];
@@ -9,9 +13,11 @@ async function withServer(testBody) {
   const previews = [];
   const turns = [];
   const uploads = [];
-  const workspace = { id: 'workspace-1', name: 'Sample', path: '/safe/workspace', branch: 'main', changedFileCount: 1, gitAvailable: true, handoffReady: true, status: 'ready' };
+  const directory = await mkdtemp(path.join(tmpdir(), 'relay-http-'));
+  const workspace = { id: 'workspace-1', name: 'Sample', path: directory, branch: 'main', changedFileCount: 1, gitAvailable: true, handoffReady: true, status: 'ready' };
   const server = createRelayServer({
     ownerLogin: 'owner@example.com',
+    sessionOptions: { stateDirectory: path.join(directory, 'controller'), scopes: new FixtureScopes() },
     listWorkspaces: async () => [workspace],
     findWorkspace: async (id) => id === workspace.id ? workspace : null,
     listProjectRoots: async () => [{ id: 'root-1', name: 'Projects' }],
@@ -36,6 +42,7 @@ async function withServer(testBody) {
       return selection;
     },
     streamNewTurn: async ({ text, onEvent }) => {
+      onEvent({ type: 'turn', threadId: 'thread-2', turnId: 'turn-2' });
       onEvent({ type: 'conversation', conversation: { id: 'thread-2', name: 'New chat' } });
       onEvent({ type: 'delta', text: `New: ${text}` });
       return { status: 'completed' };
@@ -53,6 +60,7 @@ async function withServer(testBody) {
     },
     streamTurn: async (turn) => {
       turns.push(turn);
+      turn.onEvent({ type: 'turn', threadId: 'thread-1', turnId: 'turn-1' });
       const { text, onEvent } = turn;
       onEvent({ type: 'delta', text: `Echo: ${text}` });
       return { status: 'completed' };
@@ -61,9 +69,12 @@ async function withServer(testBody) {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address();
   try {
-    await testBody({ base: `http://127.0.0.1:${port}`, hidden, interruptions, previews, turns, uploads });
+    await testBody({ base: `http://127.0.0.1:${port}`, hidden, interruptions, previews, turns, uploads, directory });
   } finally {
     await new Promise((resolve) => server.close(resolve));
+    await Promise.all([...server.sessions.active.values()].map((entry) => entry.work));
+    await server.sessions.close();
+    await rm(directory, { recursive: true, force: true });
   }
 }
 
@@ -118,7 +129,7 @@ test('hiding a chat is a Relay preference and a turn streams only workspace-scop
     const response = await fetch(`${base}/api/workspaces/workspace-1/conversations/thread-1/turns`, {
       method: 'POST',
       headers: { ...headers, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: 'hello VM', model: 'gpt-test', effort: 'medium' }),
+      body: JSON.stringify({ text: 'hello VM', model: 'gpt-test', effort: 'medium', idempotencyKey: randomUUID(), createdAt: Date.now() }),
     });
     assert.equal(response.status, 200);
     const body = await response.text();
@@ -129,14 +140,14 @@ test('hiding a chat is a Relay preference and a turn streams only workspace-scop
     const newConversation = await fetch(`${base}/api/workspaces/workspace-1/conversations/turns`, {
       method: 'POST',
       headers: { ...headers, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: 'start here', model: 'gpt-test', effort: 'medium' }),
+      body: JSON.stringify({ text: 'start here', model: 'gpt-test', effort: 'medium', idempotencyKey: randomUUID(), createdAt: Date.now() }),
     });
     assert.match(await newConversation.text(), /New: start here/);
   });
 });
 
 test('an attached document is saved inside its selected workspace', async () => {
-  await withServer(async ({ base, uploads }) => {
+  await withServer(async ({ base, uploads, directory }) => {
     const response = await fetch(`${base}/api/workspaces/workspace-1/uploads`, {
       method: 'POST',
       headers: { 'Tailscale-User-Login': 'owner@example.com', 'X-Relay-Upload-Name': encodeURIComponent('brief.txt') },
@@ -144,46 +155,24 @@ test('an attached document is saved inside its selected workspace', async () => 
     });
     assert.equal(response.status, 201);
     assert.deepEqual((await response.json()).upload, { name: 'brief.txt', path: 'uploads/brief.txt', size: 16 });
-    assert.deepEqual(uploads.map(({ workspacePath, name, content }) => [workspacePath, name, content.toString('utf8')]), [['/safe/workspace', 'brief.txt', 'private document']]);
+    assert.deepEqual(uploads.map(({ workspacePath, name, content }) => [workspacePath, name, content.toString('utf8')]), [[directory, 'brief.txt', 'private document']]);
   });
 });
 
-test('owner can stop an active Codex turn only within its selected workspace', async () => {
-  await withServer(async ({ base, interruptions }) => {
-    const response = await fetch(`${base}/api/workspaces/workspace-1/conversations/thread-1/turns/stop`, {
-      method: 'POST', headers: { 'Tailscale-User-Login': 'owner@example.com' },
-    });
-    assert.equal(response.status, 202);
-    assert.deepEqual(await response.json(), { status: 'interrupting' });
-    assert.deepEqual(interruptions, [{ cwd: '/safe/workspace', threadId: 'thread-1' }]);
+test('legacy stop without an owned active session is rejected', async () => {
+  await withServer(async ({ base }) => {
+    const response = await fetch(`${base}/api/workspaces/workspace-1/conversations/thread-1/turns/stop`, { method: 'POST', headers: { 'Tailscale-User-Login': 'owner@example.com' } });
+    assert.equal(response.status, 409);
   });
 });
 
-test('a disconnected phone stream interrupts only the Relay turn it owns', async () => {
-  const response = new EventEmitter();
-  let interruptions = 0;
-  interruptOnDisconnect(response, async () => { interruptions += 1; });
-  response.emit('close');
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(interruptions, 1);
-
-  const completedResponse = new EventEmitter();
-  const completed = interruptOnDisconnect(completedResponse, async () => { interruptions += 1; });
-  completed();
-  completedResponse.emit('close');
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(interruptions, 1);
-});
-
-test('owner can create and remove a private preview link for a workspace port', async () => {
+test('unmanaged previews cannot be published or removed through a workspace', async () => {
   await withServer(async ({ base, previews }) => {
     const headers = { 'Tailscale-User-Login': 'owner@example.com', 'Content-Type': 'application/json' };
     const created = await fetch(`${base}/api/workspaces/workspace-1/preview`, { method: 'POST', headers, body: JSON.stringify({ port: 3000 }) });
-    assert.equal(created.status, 201);
-    assert.deepEqual(await created.json(), { preview: { port: 3000, url: 'https://relay.example.ts.net:3000/' } });
+    assert.equal(created.status, 400);
     const removed = await fetch(`${base}/api/workspaces/workspace-1/preview?port=3000`, { method: 'DELETE', headers });
-    assert.deepEqual(await removed.json(), { preview: { port: 3000, status: 'stopped' } });
-    assert.deepEqual(previews, [{ action: 'open', port: 3000 }, { action: 'stop', port: '3000' }]);
+    assert.equal(removed.status, 404); assert.deepEqual(previews, []);
   });
 });
 

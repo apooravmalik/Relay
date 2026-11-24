@@ -1,7 +1,5 @@
-import { spawn } from 'node:child_process';
-import { homedir } from 'node:os';
 import { createServer } from 'node:http';
-import { mkdir, readFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -28,8 +26,10 @@ import {
   streamTurn,
   validateModelSelection,
 } from './lib/codex.mjs';
+import { SessionManager } from './lib/sessions.mjs';
+import { SessionError, terminalStates } from './lib/session-store.mjs';
 import { hiddenThreadIds, hideThread } from './lib/preferences.mjs';
-import { openPreview, stopPreview } from './lib/previews.mjs';
+import { openPreview, stopPreview, assertPreviewAvailable } from './lib/previews.mjs';
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const publicDirectory = path.join(currentDirectory, 'public');
@@ -141,43 +141,48 @@ function sseEvent(response, type, data) {
   response.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-export function interruptOnDisconnect(response, interrupt) {
-  let completed = false;
-  response.once('close', () => {
-    if (!completed) void interrupt().catch(() => {});
-  });
-  return () => { completed = true; };
-}
-
 function appError(error) {
+  if (error instanceof SessionError) return [error.status, error.message];
+  if (error.code?.includes('SQLITE')) return [503, 'Session storage is unavailable. Workspace execution remains protected.'];
   if (error.code === 'WORKSPACE_BUSY') return [409, error.message];
   if (error instanceof CodexAppServerError && ['ACTIVE_WRITER', 'NO_ACTIVE_TURN'].includes(error.code)) return [409, error.message];
   if (error instanceof CodexAppServerError) return [502, error.message];
   return [400, error.message || 'Request could not be completed.'];
 }
 
-async function lockWorkspaceTurn(id) {
-  const folder = path.join(homedir(), '.relay-v0', 'controller', 'handoff-locks');
-  await mkdir(folder, { recursive: true, mode: 0o700 });
-  const child = spawn('flock', ['-n', path.join(folder, `${id}.lock`), 'sh', '-c', 'printf ready; cat >/dev/null'],
-    { stdio: ['pipe', 'pipe', 'ignore'] });
-  child.stdin.on('error', () => {});
-  return new Promise((resolve, reject) => {
-    const failed = () => {
-      const error = new Error('Workspace is busy. Finish the active chat turn or handoff and try again.');
-      error.code = 'WORKSPACE_BUSY';
-      reject(error);
-    };
-    child.once('error', failed);
-    child.once('exit', failed);
-    child.stdout.once('data', () => {
-      resolve(() => new Promise((released) => {
-        if (child.exitCode !== null || child.signalCode !== null) return released();
-        child.once('exit', released);
-        child.stdin.end();
-      }));
-    });
-  });
+async function streamSession(manager, owner, workspaceId, id, after, response, legacy = false) {
+  await manager.ensure();
+  manager.store.get(id, owner, workspaceId);
+  manager.store.events(id, after); // Validate before committing HTTP headers.
+  if (manager.listenerCount(id) >= 8 || (manager.subscribers || 0) >= 32) throw new SessionError('Too many session subscribers. Close an unused tab and reconnect.', 429);
+  manager.subscribers = (manager.subscribers || 0) + 1;
+  response.writeHead(200, { ...securityHeaders, 'Cache-Control': 'no-store', 'Content-Type': 'text/event-stream; charset=utf-8', 'X-Accel-Buffering': 'no' });
+  response.flushHeaders();
+  let cursor = after, closed = false, blocked = false, stall;
+  const finish = () => { if (closed) return; closed = true; manager.subscribers--; clearInterval(poll); clearInterval(heartbeat); clearTimeout(stall); manager.off(id, send); response.end(); };
+  const send = () => {
+    if (closed || blocked) return;
+    try {
+      for (const event of manager.store.events(id, cursor)) {
+        let type = event.type, data = event;
+        if (legacy && type === 'status' && terminalStates.has(event.state)) { type = 'completed'; data = { status: event.state === 'INTERRUPTED' ? 'interrupted' : event.state === 'COMPLETED' ? 'completed' : 'failed' }; }
+        const writable = response.write(`id: ${event.id}\nevent: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+        cursor = event.id;
+        if (!writable) {
+          blocked = true; stall = setTimeout(() => { response.destroy(); finish(); }, 5000);
+          response.once('drain', () => { clearTimeout(stall); blocked = false; send(); });
+          return;
+        }
+      }
+      const session = manager.store.get(id, owner, workspaceId);
+      if ((terminalStates.has(session.state) || session.state === 'UNCERTAIN') && cursor === session.lastEventId) finish();
+    } catch { finish(); }
+  };
+  const poll = setInterval(send, 250);
+  const heartbeat = setInterval(() => { if (!closed && !blocked) response.write(': heartbeat\n\n'); }, 15000);
+  manager.on(id, send);
+  response.once('close', finish);
+  send(); // Query persisted IDs after subscribing: no replay/live handoff gap.
 }
 
 export function createRelayServer(dependencies = {}) {
@@ -212,11 +217,28 @@ export function createRelayServer(dependencies = {}) {
     throw new Error('RELAY_ALLOWED_TAILSCALE_LOGIN is required unless RELAY_ALLOW_LOCAL_DEV=1.');
   }
 
-  return createServer(async (request, response) => {
+  const sessions = dependencies.sessions ?? new SessionManager({
+    ...dependencies.sessionOptions,
+    run: (input) => input.threadId ? options.streamTurn(input) : options.streamNewTurn(input),
+    interrupt: options.interruptTurn,
+    openPreview: options.openPreview,
+    stopPreview: options.stopPreview,
+    checkPreview: dependencies.assertPreviewAvailable ?? assertPreviewAvailable,
+    validateThread: options.readConversation,
+    validateInput: async (input) => options.validateModelSelection(await options.listModels(), input),
+  });
+  const server = createServer(async (request, response) => {
     const login = ownerFor(request, options);
     if (!login) return writeError(response, 401, 'Relay is available only to the configured Tailnet owner.');
+    if (!['GET', 'HEAD'].includes(request.method)) {
+      const origin = request.headers.origin;
+      let crossOrigin = false;
+      try { if (origin) crossOrigin = new URL(origin).host !== request.headers.host; } catch { crossOrigin = true; }
+      if (crossOrigin || request.headers['sec-fetch-site'] === 'cross-site') return writeError(response, 403, 'Cross-origin mutations are not allowed.');
+    }
     const url = new URL(request.url, 'http://relay.local');
-    const parts = pathnameParts(url.pathname);
+    let parts;
+    try { parts = pathnameParts(url.pathname); } catch { return writeError(response, 400, 'Invalid request path.'); }
     const isApi = parts[0] === 'api';
     if (!isApi) {
       if (request.method !== 'GET') return writeError(response, 405, 'Method not allowed.');
@@ -281,11 +303,32 @@ export function createRelayServer(dependencies = {}) {
         }) });
       }
       if (request.method === 'POST' && suffix.length === 1 && suffix[0] === 'preview') {
-        const { port } = await requestBody(request);
-        return writeJson(response, 201, { preview: await options.openPreview(port) });
+        const { port, sessionId } = await requestBody(request);
+        if (!sessionId) throw new SessionError('Select an active session before publishing a task preview.', 400);
+        return writeJson(response, 201, { preview: await sessions.preview(login, workspace.id, sessionId, Number(port)) });
       }
       if (request.method === 'DELETE' && suffix.length === 1 && suffix[0] === 'preview') {
-        return writeJson(response, 200, { preview: await options.stopPreview(url.searchParams.get('port')) });
+        return writeJson(response, 200, { preview: await sessions.removePreview(login, workspace.id, Number(url.searchParams.get('port'))) });
+      }
+      if (suffix[0] === 'sessions') {
+        await sessions.ensure();
+        if (suffix.length === 1 && request.method === 'GET') return writeJson(response, 200, { sessions: sessions.store.list(login, workspace.id) });
+        if (suffix.length === 1 && request.method === 'POST') return writeJson(response, 202, { session: await sessions.start(login, workspace, await requestBody(request)) });
+        const id = suffix[1];
+        if (!id) return writeError(response, 404, 'Session not found.');
+        const session = sessions.store.get(id, login, workspace.id);
+        if (suffix.length === 2 && request.method === 'GET') return writeJson(response, 200, { session });
+        if (suffix.length === 3 && suffix[2] === 'events' && request.method === 'GET') {
+          const cursor = url.searchParams.get('after') ?? request.headers['last-event-id'] ?? '0';
+          if (!/^\d+$/.test(cursor)) throw new SessionError('Invalid event cursor.', 400);
+          return await streamSession(sessions, login, workspace.id, id, Number(cursor), response);
+        }
+        if (suffix.length === 3 && suffix[2] === 'stop' && request.method === 'POST') return writeJson(response, 202, { session: await sessions.stop(login, workspace.id, id) });
+        if (suffix.length === 3 && suffix[2] === 'recovery') {
+          if (request.method === 'GET') return writeJson(response, 200, await sessions.recovery(login, workspace.id, id));
+          if (request.method === 'POST') { const body = await requestBody(request); return writeJson(response, 200, await sessions.recovery(login, workspace.id, id, body.action, body.generation)); }
+        }
+        return writeError(response, 404, 'Not found.');
       }
       if (suffix[0] !== 'conversations') return writeError(response, 404, 'Not found.');
 
@@ -295,39 +338,8 @@ export function createRelayServer(dependencies = {}) {
         return writeJson(response, 200, { conversations });
       }
       if (request.method === 'POST' && suffix.length === 2 && suffix[1] === 'turns') {
-        const { text, model, effort } = await requestBody(request);
-        if (typeof text !== 'string' || !text.trim() || text.length > 8000) return writeError(response, 400, 'Prompt must be between 1 and 8000 characters.');
-        const selection = options.validateModelSelection(await options.listModels(), { model, effort });
-        const releaseTurn = await lockWorkspaceTurn(workspace.id);
-        response.writeHead(200, {
-          ...securityHeaders,
-          'Cache-Control': 'no-store',
-          'Content-Type': 'text/event-stream; charset=utf-8',
-          Connection: 'keep-alive',
-        });
-        sseEvent(response, 'ready', {});
-        let activeThreadId = null;
-        const streamFinished = interruptOnDisconnect(response, async () => {
-          if (activeThreadId) await options.interruptTurn({ cwd: workspace.path, threadId: activeThreadId });
-        });
-        try {
-          const result = await options.streamNewTurn({
-            cwd: workspace.path,
-            text: text.trim(),
-            ...selection,
-            onEvent(event) {
-              if (event.type === 'turn') activeThreadId = event.threadId;
-              sseEvent(response, event.type, event);
-            },
-          });
-          sseEvent(response, 'completed', { status: result.status });
-        } catch (error) {
-          const [status, message] = appError(error);
-          sseEvent(response, 'error', { status, message });
-        }
-        streamFinished();
-        await releaseTurn();
-        return response.end();
+        const session = await sessions.start(login, workspace, await requestBody(request));
+        return await streamSession(sessions, login, workspace.id, session.id, 0, response, true);
       }
 
       const threadId = suffix[1];
@@ -343,56 +355,45 @@ export function createRelayServer(dependencies = {}) {
         return response.end();
       }
       if (request.method === 'POST' && suffix.length === 4 && suffix[2] === 'turns' && suffix[3] === 'stop') {
-        await options.interruptTurn({ cwd: workspace.path, threadId });
+        await sessions.ensure();
+        const active = sessions.store.list(login, workspace.id).find((session) => session.threadId === threadId && !terminalStates.has(session.state));
+        if (!active) throw new SessionError('No active session is available to stop.');
+        await sessions.stop(login, workspace.id, active.id);
         return writeJson(response, 202, { status: 'interrupting' });
       }
       if (request.method === 'POST' && suffix.length === 3 && suffix[2] === 'turns') {
-        const { text, model, effort } = await requestBody(request);
-        if (typeof text !== 'string' || !text.trim() || text.length > 8000) return writeError(response, 400, 'Prompt must be between 1 and 8000 characters.');
-        const selection = options.validateModelSelection(await options.listModels(), { model, effort });
-        const releaseTurn = await lockWorkspaceTurn(workspace.id);
-        response.writeHead(200, {
-          ...securityHeaders,
-          'Cache-Control': 'no-store',
-          'Content-Type': 'text/event-stream; charset=utf-8',
-          Connection: 'keep-alive',
-        });
-        sseEvent(response, 'ready', {});
-        const streamFinished = interruptOnDisconnect(response, () => options.interruptTurn({ cwd: workspace.path, threadId }));
-        try {
-          const result = await options.streamTurn({
-            cwd: workspace.path,
-            threadId,
-            text: text.trim(),
-            ...selection,
-            onEvent(event) {
-              sseEvent(response, event.type, event);
-            },
-          });
-          sseEvent(response, 'completed', { status: result.status });
-        } catch (error) {
-          const [status, message] = appError(error);
-          sseEvent(response, 'error', { status, message });
-        }
-        streamFinished();
-        await releaseTurn();
-        return response.end();
+        const session = await sessions.start(login, workspace, { ...await requestBody(request), threadId });
+        return await streamSession(sessions, login, workspace.id, session.id, 0, response, true);
       }
       return writeError(response, 404, 'Not found.');
     } catch (error) {
       const [status, message] = appError(error);
+      if (response.headersSent) return response.end();
       return writeError(response, status, message);
     }
   });
+  server.sessions = sessions;
+  return server;
 }
 
-export function startRelayServer() {
+export async function startRelayServer() {
   const host = process.env.RELAY_PWA_HOST || '127.0.0.1';
   const port = Number.parseInt(process.env.RELAY_PWA_PORT || '4388', 10);
   if (!allowedHosts.has(host)) throw new Error('RELAY_PWA_HOST must be 127.0.0.1 or ::1. Use Tailscale Serve to publish privately.');
-  return createRelayServer().listen(port, host, () => {
+  const server = createRelayServer();
+  await server.sessions.ready;
+  let shuttingDown = false;
+  const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    server.sessions.draining = true;
+    server.close();
+    const drain = setInterval(async () => { if (!server.sessions.active.size && !server.sessions.starting.size) { clearInterval(drain); await server.sessions.close(); } }, 250);
+  };
+  process.once('SIGTERM', shutdown); process.once('SIGINT', shutdown);
+  return server.listen(port, host, () => {
     console.log(`Relay PWA controller listening on http://${host}:${port}`);
   });
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) startRelayServer();
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) startRelayServer().catch(() => { console.error('Relay controller startup failed. Inspect session storage and deployment prerequisites.'); process.exitCode = 1; });

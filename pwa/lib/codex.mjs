@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import readline from 'node:readline';
+import { StringDecoder } from 'node:string_decoder';
 
 const clientInfo = { name: 'relay_pwa', title: 'Relay', version: '0.1.0' };
 const activeTurns = new Map();
@@ -19,16 +19,28 @@ export class CodexAppServerError extends Error {
 }
 
 class AppServer {
-  constructor() {
-    this.child = spawn('codex', ['app-server', '--listen', 'stdio://'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  constructor(spawnOptions = {}) {
+    this.child = spawn(spawnOptions.command || 'codex', spawnOptions.args || ['app-server', '--listen', 'stdio://'], { stdio: ['pipe', 'pipe', 'pipe'] });
     this.nextId = 1;
     this.pending = new Map();
     this.listeners = new Set();
     this.stderr = '';
-    readline.createInterface({ input: this.child.stdout }).on('line', (line) => this.onMessage(line));
+    let buffer = '';
+    const decoder = new StringDecoder('utf8');
+    this.child.stdout.on('data', (chunk) => {
+      buffer += decoder.write(chunk);
+      if (Buffer.byteLength(buffer) > 2 * 1024 * 1024) { this.failAll(new CodexAppServerError('Codex protocol output exceeded the buffer limit.')); this.child.stdout.destroy(); return; }
+      let end;
+      while ((end = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, end); buffer = buffer.slice(end + 1); this.onMessage(line); }
+    });
+    this.child.stdin.on('error', (error) => this.failAll(error));
     this.child.stderr.on('data', (chunk) => { this.stderr = `${this.stderr}${chunk}`.slice(-4096); });
     this.child.on('error', (error) => this.failAll(error));
     this.child.on('exit', () => this.failAll(new CodexAppServerError(this.stderr || 'Codex app-server exited.')));
+    this.exited = new Promise((resolve) => {
+      this.child.once('exit', resolve);
+      this.child.once('error', () => { if (!this.child.pid) resolve(); });
+    });
   }
 
   onMessage(line) {
@@ -55,7 +67,13 @@ class AppServer {
   }
 
   emit(event) {
-    for (const listener of this.listeners) listener(event);
+    for (const listener of this.listeners) { try { listener(event); } catch (error) { this.failAllFromListener(error); } }
+  }
+
+  failAllFromListener(error) {
+    for (const { reject } of this.pending.values()) reject(error);
+    this.pending.clear();
+    for (const listener of this.listeners) { try { listener({ type: 'serverError', error }); } catch {} }
   }
 
   write(message) {
@@ -64,8 +82,11 @@ class AppServer {
 
   request(method, params) {
     const id = this.nextId++;
-    this.write({ jsonrpc: '2.0', id, method, params });
-    return new Promise((resolve, reject) => this.pending.set(String(id), { resolve, reject }));
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => { this.pending.delete(String(id)); reject(new CodexAppServerError('Codex request timed out.')); }, 30000);
+      this.pending.set(String(id), { resolve: (value) => { clearTimeout(timeout); resolve(value); }, reject: (error) => { clearTimeout(timeout); reject(error); } });
+      try { this.write({ jsonrpc: '2.0', id, method, params }); } catch (error) { clearTimeout(timeout); this.pending.delete(String(id)); reject(error); }
+    });
   }
 
   notify(method, params) {
@@ -83,13 +104,22 @@ class AppServer {
     this.emit({ type: 'serverError', error });
   }
 
-  close() {
-    this.child.kill();
+  async close() {
+    if (this.child.exitCode !== null || this.child.signalCode !== null || !this.child.pid) return;
+    this.child.kill('SIGTERM');
+    const force = setTimeout(() => this.child.kill('SIGKILL'), 1000);
+    let timeout;
+    try {
+      await Promise.race([this.exited, new Promise((_, reject) => { timeout = setTimeout(() => {
+        const error = new CodexAppServerError('App-server child exit could not be confirmed.');
+        error.executionUncertain = true; reject(error);
+      }, 5000); })]);
+    } finally { clearTimeout(force); clearTimeout(timeout); }
   }
 }
 
-async function withServer(work) {
-  const server = new AppServer();
+async function withServer(work, spawnOptions) {
+  const server = new AppServer(spawnOptions);
   try {
     await server.request('initialize', {
       clientInfo,
@@ -99,10 +129,12 @@ async function withServer(work) {
         mcpServerOpenaiFormElicitation: false,
       },
     });
+    // The wrapper has joined its recorded cgroup before Codex can acknowledge initialize.
+    spawnOptions?.onInitialized?.();
     server.notify('initialized', {});
     return await work(server);
   } finally {
-    server.close();
+    await server.close();
   }
 }
 
@@ -161,8 +193,8 @@ function conversationHistory(thread) {
   return (thread.turns || []).flatMap((turn) => (turn.items || []).flatMap((item) => {
     const text = itemText(item);
     if (!text) return [];
-    if (item.type === 'userMessage') return [{ role: 'user', text }];
-    if (item.type === 'agentMessage') return [{ role: 'assistant', text }];
+    if (item.type === 'userMessage') return [{ role: 'user', text, itemId: item.id, turnId: turn.id }];
+    if (item.type === 'agentMessage') return [{ role: 'assistant', text, itemId: item.id, turnId: turn.id }];
     return [];
   }));
 }
@@ -197,24 +229,33 @@ export async function readConversation(cwd, threadId) {
   });
 }
 
-async function streamConversation({ cwd, threadId, text, onEvent, model, effort }) {
+async function streamConversation({ cwd, threadId, text, onEvent, model, effort, spawnOptions }) {
   return withServer(async (server) => {
+    let expectedTurnId = null;
+    const earlyCompletions = [];
     let complete;
     let fail;
     const completeTurn = new Promise((resolve, reject) => { complete = resolve; fail = reject; });
     completeTurn.catch(() => {});
     const removeListener = server.onEvent((event) => {
       if (event.type === 'serverError') fail(event.error);
+      if (event.params?.threadId && threadId && event.params.threadId !== threadId) return;
+      if (event.params?.turnId && expectedTurnId && event.params.turnId !== expectedTurnId) return;
       if (event.type === 'approval') onEvent({ type: 'approval' });
       if (event.method === 'item/agentMessage/delta') {
         const delta = event.params.delta || event.params.text || '';
-        if (delta) onEvent({ type: 'delta', text: delta });
+        if (delta) onEvent({ type: 'delta', text: delta, threadId: event.params.threadId, turnId: event.params.turnId, itemId: event.params.itemId });
       }
       if (event.method === 'item/reasoning/summaryTextDelta') {
         const text = event.params.delta || '';
-        if (text) onEvent({ type: 'reasoning', text });
+        if (text) onEvent({ type: 'reasoning', text, threadId: event.params.threadId, turnId: event.params.turnId, itemId: event.params.itemId, summaryIndex: event.params.summaryIndex });
       }
-      if (event.method === 'turn/completed') complete(event.params.turn || event.params);
+      if (event.method === 'turn/completed') {
+        const turn = event.params.turn;
+        if (event.params.threadId !== threadId || !turn?.id) return;
+        if (!expectedTurnId) earlyCompletions.push(turn);
+        else if (turn.id === expectedTurnId) complete(turn);
+      }
     });
     try {
       let startedNewThread = false;
@@ -251,18 +292,20 @@ async function streamConversation({ cwd, threadId, text, onEvent, model, effort 
         input: [{ type: 'text', text }],
       });
       const turnId = startedTurn?.turn?.id;
+      expectedTurnId = turnId;
       if (!turnId) throw new CodexAppServerError('Codex did not return an active turn ID.');
       const key = activeTurnKey(cwd, threadId);
       activeTurns.set(key, { server, turnId });
       onEvent({ type: 'turn', threadId, turnId });
+      for (const early of earlyCompletions) if (early.id === turnId) complete(early);
       const turn = await completeTurn;
       if (turn.status !== 'completed' && turn.status !== 'interrupted') throw new CodexAppServerError(`Codex turn ended with status: ${turn.status || 'unknown'}.`);
-      return { status: turn.status, threadId };
+      return { status: turn.status, threadId, turnId };
     } finally {
       if (threadId) activeTurns.delete(activeTurnKey(cwd, threadId));
       removeListener();
     }
-  });
+  }, spawnOptions);
 }
 
 export function streamTurn(options) {
