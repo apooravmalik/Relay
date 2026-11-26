@@ -1,5 +1,7 @@
 """Cross-language guard tests: actual Node-created store, standalone SSH helper."""
 import json
+from contextlib import closing
+import fcntl
 import os
 from pathlib import Path
 import shutil
@@ -48,7 +50,7 @@ s.reserve({{owner:'owner',workspace:{{id:'fixture',path:process.argv[2]}},key:bo
         ]
         database = self.controller / 'sessions/sessions.sqlite'
         for state in ['STARTING', 'RUNNING', 'CANCEL_REQUESTED', 'UNCERTAIN']:
-            with sqlite3.connect(database) as connection:
+            with closing(sqlite3.connect(database)) as connection, connection:
                 connection.execute('UPDATE sessions SET state=?', (state,))
             for action in actions:
                 with self.subTest(state=state, action=action), self.assertRaisesRegex(RuntimeError, 'source_busy'):
@@ -70,15 +72,56 @@ s.reserve({{owner:'owner',workspace:{{id:'fixture',path:process.argv[2]}},key:bo
 
     def test_terminal_guard_must_be_cleared_and_new_legacy_installations_remain_usable(self):
         database = self.controller / 'sessions/sessions.sqlite'
-        with sqlite3.connect(database) as connection:
+        with closing(sqlite3.connect(database)) as connection, connection:
             connection.execute("UPDATE sessions SET state='COMPLETED'")
         with self.assertRaisesRegex(RuntimeError, 'source_busy'):
             helper.assert_session_idle('fixture')
-        with sqlite3.connect(database) as connection:
+        with closing(sqlite3.connect(database)) as connection, connection:
             connection.execute('DELETE FROM workspace_guards')
         helper.assert_session_idle('fixture')
         with patch.dict(os.environ, {'RELAY_CONTROLLER_STATE_DIR': str(self.root / 'fresh-controller')}):
             helper.assert_session_idle('fixture')
+
+    def test_overlapping_workspace_capture_is_blocked_but_sibling_is_not(self):
+        child = self.workspace / 'child'
+        child.mkdir()
+        sibling = self.root / 'workspace-sibling'
+        sibling.mkdir()
+        with self.assertRaisesRegex(RuntimeError, 'source_busy'):
+            helper.assert_session_idle('different-id', child)
+        with self.assertRaisesRegex(RuntimeError, 'source_busy'):
+            helper.assert_session_idle('different-id', self.root)
+        helper.assert_session_idle('different-id', sibling)
+        with closing(sqlite3.connect(self.controller / 'sessions/sessions.sqlite')) as connection, connection:
+            connection.execute("UPDATE sessions SET state='UNCERTAIN'")
+        with self.assertRaisesRegex(RuntimeError, 'source_busy'):
+            helper.assert_session_idle('different-id', child)
+
+    def test_shared_reservation_gate_blocks_handoff_before_it_can_check_state(self):
+        directory = self.controller / 'handoff-locks'
+        directory.mkdir(exist_ok=True)
+        with (directory / 'workspace-hierarchy.lock').open('a') as gate:
+            fcntl.flock(gate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(RuntimeError, 'source_busy'):
+                helper.capture(self.workspace, 'fixture')
+
+    def test_overlapping_pending_handoff_blocks_other_workspace_but_allows_resume(self):
+        directory = self.root / '.relay-v0/checkpoints/child-id'
+        directory.mkdir(parents=True)
+        checkpoint = directory / 'endpoint.json'
+        checkpoint.write_text(json.dumps({'pending': {'workspace_id': 'child-id', 'source_path': str(self.workspace / 'child')}}))
+        with patch.dict(os.environ, {'HOME': str(self.root)}):
+            with self.assertRaisesRegex(RuntimeError, 'source_busy'):
+                helper.assert_no_overlapping_pending('parent-id', self.workspace)
+            helper.assert_no_overlapping_pending('child-id', self.workspace / 'child')
+            helper.assert_no_overlapping_pending('sibling-id', self.root / 'workspace-sibling')
+            checkpoint.write_text('{broken')
+            with self.assertRaisesRegex(RuntimeError, 'source_busy'):
+                helper.assert_no_overlapping_pending('sibling-id', self.root / 'workspace-sibling')
+            checkpoint.unlink()
+            checkpoint.symlink_to('/dev/null')
+            with self.assertRaisesRegex(RuntimeError, 'source_busy'):
+                helper.assert_no_overlapping_pending('sibling-id', self.root / 'workspace-sibling')
 
 
 if __name__ == '__main__':

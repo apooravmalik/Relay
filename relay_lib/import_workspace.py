@@ -40,6 +40,22 @@ def ssh_command(vm):
 
 def remote(ssh, host, workspace, action, request=None):
     command = 'python3 -c ' + shlex.quote(HELPER) + ' ' + shlex.quote(workspace) + ' ' + action
+    # A non-default controller must use the same guard database and registry as
+    # its PWA. Require the full configuration together to avoid partial routing.
+    names = {
+        'RELAY_REMOTE_CONTROLLER_STATE_DIR': 'RELAY_CONTROLLER_STATE_DIR',
+        'RELAY_REMOTE_WORKSPACE_REGISTRY_FILE': 'RELAY_WORKSPACE_REGISTRY_FILE',
+        'RELAY_REMOTE_WORKSPACE_ROOTS': 'RELAY_WORKSPACE_ROOTS',
+    }
+    configured = {target: os.environ.get(source) for source, target in names.items()}
+    if any(value is not None for value in configured.values()):
+        if not all(configured.values()):
+            raise ValueError('Set all three RELAY_REMOTE_CONTROLLER_STATE_DIR, RELAY_REMOTE_WORKSPACE_REGISTRY_FILE and RELAY_REMOTE_WORKSPACE_ROOTS together.')
+        for name, value in configured.items():
+            paths = value.split(':') if name == 'RELAY_WORKSPACE_ROOTS' else [value]
+            if any(not path.startswith('/') or '\0' in path or '\n' in path for path in paths):
+                raise ValueError('Remote controller and workspace paths must be absolute.')
+        command = 'env ' + ' '.join(shlex.quote(name + '=' + value) for name, value in configured.items()) + ' ' + command
     result = subprocess.run([*ssh, host, command], stdout=subprocess.PIPE, stderr=subprocess.PIPE, input=json.dumps(request).encode() if request is not None else None)
     try: data = json.loads(result.stdout)
     except ValueError: raise ValueError('Could not obtain a response over SSH; check connectivity and remote Python and Git.')

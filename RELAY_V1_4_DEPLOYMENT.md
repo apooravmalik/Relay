@@ -10,6 +10,26 @@ Keep the existing owner login and private Tailscale Serve configuration. The app
 
 1. Deploy the candidate checkout as one artifact, including `pwa`, `relay_lib/session_scope_exec.py`, and the updated transfer helper. Retain the previous artifact and record the revision/hash. Update the paired desktop CLI to the same compatible implementation before handoffs. Old desktop clients ship their own helper and are outside the supported guarded workflow; full same-user SSH is not a tenant isolation boundary.
 2. Use a dedicated candidate systemd unit/workspace/state directory first. Adapt the example drop-in's cgroup path to the candidate unit name. Set the same `RELAY_CONTROLLER_STATE_DIR` in the controller and SSH transfer environment. Default is `/home/relay/.relay-v0/controller`; session state is private and excluded from workspace transfers.
+   Set a separate `RELAY_WORKSPACE_REGISTRY_FILE`, `RELAY_WORKSPACE_ROOTS`,
+   `RELAY_PROJECT_ROOTS`, and `RELAY_PREFERENCES_FILE` for the candidate too.
+   Otherwise it also lists the live service's registered workspaces while its
+   separate guards cannot coordinate with the live service. Verify the candidate
+   lists only disposable workspaces. Configure the matching registry, roots and
+   controller state in the SSH helper environment before testing handoffs.
+   For the desktop workspace CLI, set all three explicit remote paths together:
+
+   ```bash
+   export RELAY_REMOTE_CONTROLLER_STATE_DIR=/home/relay/.relay-v14-test/controller
+   export RELAY_REMOTE_WORKSPACE_REGISTRY_FILE=/home/relay/.relay-v14-test/controller/workspaces.json
+   export RELAY_REMOTE_WORKSPACE_ROOTS=/home/relay/.relay-v14-test/workspaces
+   ```
+
+   These settings select the helper's remote environment; they must match the
+   actual candidate service. Omitting them uses the remote SSH account's defaults.
+   They do not prevent older helpers or arbitrary same-user SSH commands from
+   bypassing this supported-workflow guard. The controller and desktop helper
+   must both include the shared workspace-hierarchy gate; deploying only one side
+   does not close the overlapping-path start/transfer race.
 3. An administrator must install [relay-pwa-v14.conf](deploy/relay-pwa-v14.conf) under the appropriate unit's drop-in directory and reload systemd. The current live controller has `NoNewPrivileges=true`; `sudo` from that service cannot install delegation. Keep that protection rather than turning it off for privilege escalation. Apply this prerequisite through an administrative connection.
 4. Drain existing tasks and transfers before restarting/deploying. The existing live implementation conversation is inside `relay-pwa.service`; restarting it interrupts that conversation. Use a separate administrative session and the tested candidate deployment procedure.
 5. Run `node deploy/check-v14-prerequisites.mjs` inside the candidate service's execution context. A shell elsewhere on the VM can have different cgroup permissions and does not validate the service. Then run the opt-in cgroup test: `RELAY_TEST_DELEGATED_CGROUP=1 node --test pwa/test/session-scope-vm.test.mjs`. That test creates only its own scope and loopback fixture server, including a detached descendant; do not set the flag on an undelegated or production task scope.

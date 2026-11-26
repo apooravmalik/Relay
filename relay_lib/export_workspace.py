@@ -1,7 +1,7 @@
 """Remote, read-only workspace capture helper, executed by the local CLI over SSH."""
 import hashlib
 import sqlite3
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import fnmatch
 import fcntl
 import json
@@ -583,7 +583,7 @@ def _batch_directory(transfer):
 _turn_locks = {}
 
 
-def assert_session_idle(workspace_id):
+def assert_session_idle(workspace_id, workspace_root=None):
     controller = Path(os.environ.get('RELAY_CONTROLLER_STATE_DIR', Path.home() / '.relay-v0/controller'))
     directory = controller / 'sessions'
     database, marker = directory / 'sessions.sqlite', directory / 'initialized'
@@ -593,21 +593,74 @@ def assert_session_idle(workspace_id):
     try:
         if database.is_symlink() or not database.is_file() or marker.read_text() != '1\n':
             raise ValueError('Missing or invalid initialized store.')
-        with sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True, timeout=2) as connection:
+        with closing(sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True, timeout=2)) as connection:
             if connection.execute('PRAGMA user_version').fetchone()[0] != 1:
                 raise ValueError('Unsupported session schema.')
             guard = connection.execute('SELECT session_id FROM workspace_guards WHERE workspace_id=?', (workspace_id,)).fetchone()
             active = connection.execute("SELECT id FROM sessions WHERE workspace_id=? AND state NOT IN ('COMPLETED','FAILED','INTERRUPTED')", (workspace_id,)).fetchone()
             if guard or active:
                 error('source_busy', 'Relay execution is active or uncertain. Stop or recover the session before handoff.')
+            if workspace_root is not None:
+                target = os.path.realpath(workspace_root)
+                rows = connection.execute("SELECT s.workspace_path FROM sessions s LEFT JOIN workspace_guards g ON g.session_id=s.id WHERE g.session_id IS NOT NULL OR s.state NOT IN ('COMPLETED','FAILED','INTERRUPTED')").fetchall()
+                for (path,) in rows:
+                    if not isinstance(path, str) or not os.path.isabs(path):
+                        raise ValueError('Invalid guarded workspace path.')
+                    other = os.path.realpath(path)
+                    common = os.path.commonpath((target, other))
+                    if common in (target, other):
+                        error('source_busy', 'An overlapping Relay workspace has active or uncertain execution.')
     except RuntimeError:
         raise
     except Exception:
         error('source_busy', 'Session storage cannot be verified. Restore or recover it before handoff.')
 
 
+def assert_no_overlapping_pending(workspace_id, workspace_root):
+    if workspace_root is None:
+        error('source_busy', 'Workspace path cannot be verified before handoff.')
+    target = os.path.realpath(workspace_root)
+    directory = Path.home() / '.relay-v0' / 'checkpoints'
+    try:
+        try:
+            info = directory.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError('Invalid checkpoint directory.')
+        for folder in directory.iterdir():
+            folder_info = folder.lstat()
+            if stat.S_ISLNK(folder_info.st_mode):
+                raise ValueError('Symlink in checkpoint directory.')
+            if not stat.S_ISDIR(folder_info.st_mode):
+                continue
+            for file in folder.iterdir():
+                if file.suffix != '.json':
+                    continue
+                if not stat.S_ISREG(file.lstat().st_mode):
+                    raise ValueError('Invalid checkpoint file.')
+                data = json.loads(file.read_text())
+                pending = data.get('pending')
+                if not pending:
+                    continue
+                if not isinstance(pending, dict) or pending.get('workspace_id') != file.parent.name:
+                    raise ValueError('Invalid pending handoff identity.')
+                source = pending.get('source_path')
+                if not isinstance(source, str) or not os.path.isabs(source):
+                    raise ValueError('Invalid pending handoff path.')
+                if file.parent.name == workspace_id:
+                    continue  # Same workspace must be able to resume its own journal.
+                other = os.path.realpath(source)
+                if os.path.commonpath((target, other)) in (target, other):
+                    error('source_busy', 'An overlapping workspace has a pending handoff. Resume or recover it first.')
+    except RuntimeError:
+        raise
+    except Exception:
+        error('source_busy', 'Pending handoff state cannot be verified. Inspect recovery before continuing.')
+
+
 @contextmanager
-def turn_lock(workspace_id):
+def turn_lock(workspace_id, workspace_root=None):
     # A remote action may call capture/checkpoint helpers in the same process.
     if workspace_id in _turn_locks:
         yield _turn_locks[workspace_id]
@@ -615,12 +668,16 @@ def turn_lock(workspace_id):
     controller = Path(os.environ.get('RELAY_CONTROLLER_STATE_DIR', Path.home() / '.relay-v0/controller'))
     lock_path = controller / 'handoff-locks' / (workspace_id + '.lock')
     lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with lock_path.open('a') as lock:
+    # Match the PWA reservation gate. Holding it through the remote operation
+    # closes the check/reserve race for overlapping workspace paths.
+    with (lock_path.parent / 'workspace-hierarchy.lock').open('a') as gate, lock_path.open('a') as lock:
         try:
+            fcntl.flock(gate, fcntl.LOCK_EX | fcntl.LOCK_NB)
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             error('source_busy', 'A Relay chat turn or workspace handoff is active.')
-        assert_session_idle(workspace_id)
+        assert_session_idle(workspace_id, workspace_root)
+        assert_no_overlapping_pending(workspace_id, workspace_root)
         _turn_locks[workspace_id] = lock
         try:
             yield lock
@@ -1000,7 +1057,7 @@ def git_handoff_remote(root, workspace_id, action, request):
     receiving = request.get('receiving', base)
     identity = {'endpoint': endpoint}
     directory = _batch_directory(transfer)
-    with turn_lock(workspace_id), _batch_lock(workspace_id):
+    with turn_lock(workspace_id, root), _batch_lock(workspace_id):
         current = checkpoint(root, workspace_id, dict(identity, action='get'))
         done = current == {'checkpoint': proposed, 'pending': None}
         if not done and (current['checkpoint'] != base or current['pending'] not in (None, proposed)):
@@ -1037,7 +1094,7 @@ def git_handoff_remote(root, workspace_id, action, request):
 
 def _guarded(function):
     def guarded(root, workspace_id, *args, **kwargs):
-        with turn_lock(workspace_id):
+        with turn_lock(workspace_id, root):
             return function(root, workspace_id, *args, **kwargs)
     return guarded
 
@@ -1050,7 +1107,7 @@ _original_checkpoint = checkpoint
 def checkpoint(root, workspace_id, request):
     if request.get('action') == 'get':
         return _original_checkpoint(root, workspace_id, request)
-    with turn_lock(workspace_id):
+    with turn_lock(workspace_id, root):
         return _original_checkpoint(root, workspace_id, request)
 
 
@@ -1092,7 +1149,7 @@ def main():
             result = {'digest': read_policy(root)[0]}
         elif action == 'git_capture':
             request = json.load(sys.stdin)
-            with turn_lock(workspace_id):
+            with turn_lock(workspace_id, root):
                 direct_git_directory(root)
                 _push_assert_idle(root)
                 against = request.get('against')
@@ -1103,7 +1160,7 @@ def main():
                 manifest, path = capture(root, workspace_id, include_history=request['include_history'], against=against)
             result = {'manifest': manifest, 'export_path': path}
         elif action == 'capture':
-            with turn_lock(workspace_id):
+            with turn_lock(workspace_id, root):
                 manifest, path = capture(root, workspace_id)
             result = {'manifest': manifest, 'export_path': path}
         else: error('invalid_request', 'Unknown operation.')

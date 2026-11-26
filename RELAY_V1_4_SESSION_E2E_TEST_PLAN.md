@@ -30,7 +30,11 @@ phone-sized browser, and opens the same session in a second browser. It leaves t
 test session and file in that workspace for review. It does not test a physical phone.
 It records Send-to-acceptance and Send-to-visible-message timings, independently
 reads the session event stream, and compares streamed and final text with both
-browser transcripts. Timing results are observations, not release thresholds.
+browser transcripts. It also takes the first browser offline, checks that the
+heartbeat advances, then verifies the same session reconnects. The independent
+event-stream observer is attached only after the closure and offline intervals,
+so it does not keep the session subscribed during those checks. Timing results
+are observations, not release thresholds.
 
 ```bash
 RELAY_PLAYWRIGHT_MODULE=/absolute/path/to/playwright/index.mjs \
@@ -42,9 +46,65 @@ node pwa/test/session-live-playwright.mjs
 ```
 
 Omit `RELAY_E2E_BROWSER_EXECUTABLE` to use Playwright's installed Chromium. The
+default closure and offline periods are six seconds; set
+`RELAY_E2E_CLOSED_MS=120000` for the two-minute closure check and optionally set
+`RELAY_E2E_OFFLINE_MS` for a longer offline interval. This extends the heartbeat
+task automatically. A browser simulation is not a physical-phone test. The
 browser host must already be authorized to access the candidate. If the test
 fails after starting a task, inspect its printed session and let it finish or stop
 it through the PWA before retrying; closing the test browser does not stop it.
+
+The additional `pwa/test/session-live-guard.mjs` test creates a disposable plain
+workspace under `RELAY_E2E_ROOT_ID`, starts a real task, verifies that the
+candidate refuses a nested task and the configured SSH helper refuses an import
+of the workspace and its nested child
+while it writes, requests Stop, closes and reopens the browser, and imports after
+confirmed termination. This does not test the simultaneous-start race. Set the same variables above, replace
+`RELAY_E2E_WORKSPACE_ID` with `RELAY_E2E_ROOT_ID` and set `RELAY_E2E_VM` plus the
+three `RELAY_REMOTE_*` paths documented in the deployment guide. It leaves the
+remote workspace and local imported fixture for inspection. Its failure cleanup
+requests Stop but cannot guarantee termination; inspect the printed session.
+Set `RELAY_E2E_GIT=1` to initialize a disposable Git repository and verify its
+commit and index after import. The `session-live-handoff-race.mjs` test holds
+the remote shared gate and verifies the candidate refuses a PWA task start; it
+requires the same URL, root ID, VM, controller path, and disposable flag.
+
+For a local browser/controller crash fixture, run:
+
+```bash
+RELAY_PLAYWRIGHT_MODULE=/absolute/path/to/playwright/index.mjs \
+RELAY_E2E_BROWSER_EXECUTABLE=/optional/path/to/chrome \
+node pwa/test/session-browser-crash.mjs
+```
+
+This test kills only its own temporary controller, observes a fixture writer,
+checks the standalone helper guard with the controller absent, and verifies the
+browser reopens to UNCERTAIN with new tasks and unverified recovery blocked. It
+uses an injected process scope and does not replace real-cgroup or real-Codex
+crash acceptance.
+
+`pwa/test/session-live-crash.mjs` exercises real Codex and cgroups in a separately
+created transient VM service. It requires the Playwright module, `RELAY_E2E_VM`,
+absolute `RELAY_E2E_REMOTE_TEST_ROOT` and `RELAY_E2E_REMOTE_CHECKOUT`, plus
+`RELAY_E2E_DISPOSABLE=1` and `RELAY_E2E_CRASH_SERVICE=1`. The SSH user must have
+noninteractive sudo for that transient service. It kills only its uniquely named
+test controller, stops that service afterward, and retains its private fixture
+directory for inspection; never point it at an existing service.
+
+```bash
+RELAY_PLAYWRIGHT_MODULE=/absolute/path/to/playwright/index.mjs \
+RELAY_E2E_VM=YOUR_SSH_ALIAS \
+RELAY_E2E_REMOTE_TEST_ROOT=/absolute/private/test/root \
+RELAY_E2E_REMOTE_CHECKOUT=/absolute/path/to/candidate/checkout \
+RELAY_E2E_DISPOSABLE=1 RELAY_E2E_CRASH_SERVICE=1 \
+node pwa/test/session-live-crash.mjs
+```
+
+`pwa/test/session-live-preview.mjs` uses the same candidate URL, root ID, VM,
+Playwright module and disposable flag as the guard test. It starts a real
+loopback server through Codex, publishes a session-owned private preview, closes
+and reopens the browser, and verifies the server and route are removed on Stop.
+If it cannot verify cleanup, inspect the printed session and port before retrying.
 
 ## Automated acceptance matrix
 
@@ -126,12 +186,13 @@ Release only after S01–S19 pass at their required layers, the real VM crash/re
 | SQLite feasibility probe | Passed Node/Python interoperability, transaction rollback/committed WAL after fixture SIGKILL, and private permissions on 23 November 2026 | [Decision register E-02](RELAY_V1_4_DECISIONS.md); prerequisite evidence only, not a pass for S10/S13 |
 | V1.4 Node fixtures | 63 passed, one actual-cgroup test skipped, zero failed; 23 November 2026 | `npm test` (64 tests); deterministic Codex fixtures, real child servers, SIGKILL/orphan recovery, SQLite failure tests. Selected scenarios in S01–S19 have fixture coverage; remaining process/device layers and kill-at-every-boundary cases are pending |
 | Rendered mobile browser | Passed on Chromium, 390 × 844; 23 November 2026 | `RELAY_PLAYWRIGHT_MODULE=/path/to/playwright/index.mjs node pwa/test/session-browser.mjs`; mock execution, real browser. Closure/replay, history, files, two clients, Stop and recovery |
-| Production cgroup prerequisite | Blocked: service has no delegation | `node deploy/check-v14-prerequisites.mjs`; install administrator prerequisite, then run opt-in VM suite |
+| Candidate cgroup prerequisite | Passed on dedicated delegated test service; production service remains undelegated | Startup checker and opt-in detached-child cgroup fixture, 24 November 2026 |
 | Python handoff and guard regressions | 76 passed, two real-SSH suites skipped, zero failed (78 total); 23 November 2026 | Includes initialized/corrupt/missing storage and guarded transfer entrypoints; existing local Git/plain regressions |
-| Real SSH Git/plain regression | Not run for V1.4 | Record target and receipts |
-| Real Codex VM session run | Not run | Record IDs and process evidence |
+| Real SSH Git/plain regression | Both isolated SSH suites passed sequentially on Linux, 25 November 2026. A later Git rerun using the updated helper passed on 26 November. Earlier runs encountered SSH resets; the retained test fixture was removed. | `RELAY_DISPOSABLE_TEST_VM=relay-do-v0 python3 -m unittest -v relay_lib.test_vm_plain_push relay_lib.test_vm_git_handoff`; fixture data only |
+| Real Codex VM session run | Passed a 120-second browser closure with no event-stream subscriber (heartbeat advanced 1→61), simulated offline/reconnect, and matching replay in two browsers. The offline-state test failed before the UI fix. This is not a physical-phone pass. | `session-live-playwright.mjs`; 26 November 2026 |
 | Physical phone lock/offline/reopen | Not run | Record device, duration and matching session |
-| Explicit Stop and handoff locking | Fixture HTTP/process/Python guards passed; paired SSH receipts pending | Node session tests and Python guard tests |
-| Controller crash/orphan/recovery | Passed with actual controller SIGKILL and orphan fixture; production cgroup run pending | `pwa/test/session-restart.test.mjs`; injected process driver, not actual Codex |
+| Explicit Stop and handoff locking | Real Codex writing task: candidate-configured SSH plain and Git imports refused while active; Stop confirmed after browser closure, heartbeat stopped, session reopened, imports succeeded afterward. The PWA gate test failed with HTTP 202 before the fix and passed afterward. Repeated Git cycles on the new candidate and physical-phone cases remain. | `session-live-guard.mjs`, `session-live-handoff-race.mjs`; 26 November 2026 |
+| Controller crash/orphan/recovery | Passed local Playwright orphan fixture; an isolated transient real-VM controller run verified a populated owned cgroup, blocked SSH during SIGKILL, reopened UNCERTAIN without replay, and kept SSH blocked after an unverified recheck. A long-message recovery layout failed before its CSS fix and passed afterward. Broader fault points and physical-phone checks remain. | `session-browser-crash.mjs`, `session-live-crash.mjs`; 26 November 2026 |
+| Real preview lifetime | A private preview remained available across browser closure; the owned server and route were removed before confirmed Stop, and pre-existing Tailnet route configuration was unchanged. Success/failure completion and unrelated-server-process cases remain. | `session-live-preview.mjs`; 26 November 2026 |
 
 Remaining limitations to state explicitly: no claimed seamless controller/host restart continuation; replay limited to retained committed events; arbitrary external writers outside the verified ownership scope; single-owner authorization rather than tenant isolation.

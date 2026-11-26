@@ -675,7 +675,9 @@ function sessionStatus() {
   const session = state.session;
   if (!session) return;
   const labels = { STARTING: 'Starting on VM…', RUNNING: 'Working on VM…', CANCEL_REQUESTED: 'Stopping…', COMPLETED: 'Completed', INTERRUPTED: 'Stopped', FAILED: 'Failed', UNCERTAIN: 'Execution uncertain — recovery required' };
-  document.querySelector('#chat-status').textContent = session.phase === 'finishing' ? 'Finishing and stopping task servers…' : labels[session.state];
+  document.querySelector('#chat-status').textContent = !navigator.onLine && !finishedStates.has(session.state)
+    ? 'Offline — reconnect to see VM progress.'
+    : session.phase === 'finishing' ? 'Finishing and stopping task servers…' : labels[session.state];
   setBusy(!finishedStates.has(session.state));
   stopTurn.hidden = finishedStates.has(session.state) || session.state === 'UNCERTAIN';
   stopTurn.disabled = session.state === 'CANCEL_REQUESTED' || session.phase === 'finishing';
@@ -683,7 +685,7 @@ function sessionStatus() {
   document.querySelector('#recovery-message').textContent = session.reason || 'Relay cannot prove this task stopped. New tasks and handoffs are blocked.';
 }
 
-async function openSession(selected) {
+async function openSession(selected, optimistic = null) {
   detachSession();
   setBusy(true);
   const view = state.view, workspaceId = state.workspace.id;
@@ -695,6 +697,7 @@ async function openSession(selected) {
   document.querySelector('#chat-title').textContent = 'VM session';
   document.querySelector('#hide-chat').hidden = !session.threadId;
   messageList.replaceChildren();
+  if (optimistic) messageList.append(optimistic.message);
   try { localStorage.setItem('relay-session-selection', JSON.stringify({ workspaceId, sessionId: session.id })); } catch {}
   await loadModels();
   if (view !== state.view) return;
@@ -709,6 +712,7 @@ async function openSession(selected) {
         if (!session.eventsExpired && message.turnId && message.turnId === session.turnId) continue;
         const content = appendMessage(message.role, message.text);
         if (message.turnId) content.closest('article').dataset.historyTurn = message.turnId;
+        if (optimistic) messageList.insertBefore(content.closest('article'), optimistic.message);
       }
     } catch { if (view === state.view) appendMessage('system', 'Saved history could not be loaded. Session output is available below.'); }
   }
@@ -720,11 +724,18 @@ async function openSession(selected) {
   const abort = new AbortController(); state.feed = abort;
   void followSession(`/api/workspaces/${workspaceId}/sessions/${session.id}/events`, {
     signal: abort.signal,
-    onConnection(connected) { if (view === state.view) { if (connected) sessionStatus(); else document.querySelector('#chat-status').textContent = 'Reconnecting… Task status will refresh from the VM.'; } },
+    onConnection(connected) { if (view === state.view) { if (connected || !navigator.onLine) sessionStatus(); else document.querySelector('#chat-status').textContent = 'Reconnecting… Task status will refresh from the VM.'; } },
     onEvent(event) {
       if (view !== state.view) return;
       state.session.generation = event.id; state.session.lastEventId = event.id;
-      if (event.type === 'input') appendMessage('user', event.text);
+      if (event.type === 'input') {
+        if (optimistic) {
+          renderMarkdown(optimistic.content, event.text);
+          optimistic.label.remove();
+          optimistic.message.removeAttribute('data-pending-send');
+          optimistic = null;
+        } else appendMessage('user', event.text);
+      }
       if (event.type === 'conversation') {
         state.conversation = event.conversation; state.session.threadId = event.conversation.id;
         document.querySelector('#chat-title').textContent = event.conversation.name;
@@ -764,26 +775,36 @@ async function sendPrompt(event) {
   const message = prompt.value.trim();
   if (state.busy || (!message && !state.attachment) || !state.conversation) return;
   setBusy(true);
+  messageList.querySelector('[data-pending-send="failed"]')?.remove();
+  const content = appendMessage('user', message || 'Please inspect the uploaded file.');
+  const pendingMessage = content.closest('article');
+  pendingMessage.dataset.pendingSend = 'sending';
+  const label = element('span', 'conversation-status', 'Sending…');
+  pendingMessage.append(label);
+  const optimistic = { message: pendingMessage, content, label };
+  document.querySelector('#chat-status').textContent = 'Sending…';
   let body, workspaceId = state.workspace.id;
   try {
     const upload = await uploadAttachment();
     const text = upload ? `${message || 'Please inspect the uploaded file.'}\n\nUploaded file: ${upload.path}` : message;
+    if (upload) renderMarkdown(content, text);
     const selection = { model: modelSelect.value || undefined, effort: effortSelect.value || undefined };
     const pending = state.pendingStart?.workspaceId === workspaceId ? state.pendingStart : null;
     body = { text, ...selection, threadId: state.conversation.id || undefined, idempotencyKey: pending?.idempotencyKey || crypto.randomUUID(), createdAt: pending?.createdAt || Date.now() };
     state.pendingStart = { workspaceId, idempotencyKey: body.idempotencyKey, createdAt: body.createdAt };
     try { localStorage.setItem('relay-pending-start', JSON.stringify(state.pendingStart)); } catch {}
     const { session } = await api(`/api/workspaces/${workspaceId}/sessions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    label.textContent = 'Accepted · loading…';
     state.pendingStart = null; try { localStorage.removeItem('relay-pending-start'); } catch {}
     prompt.value = ''; resizePrompt(); state.attachment = null; uploadInput.value = ''; renderAttachment();
-    await openSession(session);
+    await openSession(session, optimistic);
   } catch (error) {
     // A lost start response is resolved by discovery, never a fresh POST/key.
     if (body) {
       try {
         const result = await api(`/api/workspaces/${workspaceId}/sessions`);
         const latest = result.sessions.find((session) => session.requestKey === body.idempotencyKey);
-        if (latest) { state.pendingStart = null; try { localStorage.removeItem('relay-pending-start'); } catch {} await openSession(latest); return; }
+        if (latest) { state.pendingStart = null; try { localStorage.removeItem('relay-pending-start'); } catch {} label.textContent = 'Accepted · loading…'; await openSession(latest, optimistic); return; }
       } catch {}
     }
     if (error.status === 410) {
@@ -791,6 +812,9 @@ async function sendPrompt(event) {
       try { localStorage.removeItem('relay-pending-start'); } catch {}
     }
     appendMessage('system', `${error.message} Review saved sessions before sending again.`);
+    pendingMessage.dataset.pendingSend = 'failed';
+    label.textContent = 'Not confirmed';
+    document.querySelector('#chat-status').textContent = 'Send needs attention';
     setBusy(false);
   }
 }
@@ -969,6 +993,17 @@ stopTurn.addEventListener('click', async () => {
   }
 });
 composer.addEventListener('submit', sendPrompt);
+window.addEventListener('offline', () => {
+  if (!state.session) return;
+  state.feed?.abort(); state.feed = null;
+  sessionStatus();
+});
+window.addEventListener('online', () => {
+  if (!state.workspace || !state.session || finishedStates.has(state.session.state) || state.session.state === 'UNCERTAIN') return;
+  const id = state.session.id, workspaceId = state.workspace.id;
+  const reopening = openSession({ id }), view = state.view;
+  void reopening.catch(() => { if (view === state.view && workspaceId === state.workspace?.id) document.querySelector('#chat-status').textContent = 'Session connection needs attention'; });
+});
 prompt.addEventListener('input', resizePrompt);
 uploadInput.addEventListener('change', () => {
   const [file] = uploadInput.files;
@@ -987,7 +1022,9 @@ loadHome().then(async () => {
     const { workspaces } = await api('/api/workspaces');
     const workspace = workspaces.find((item) => item.id === selected.workspaceId);
     if (workspace) {
-      await openWorkspace(workspace);
+      // Restore the selected session independently of the conversation list.
+      // A slow list request must not hold the transcript and live feed back.
+      void openWorkspace(workspace);
       if (state.pendingStart?.workspaceId === workspace.id) {
         const { sessions } = await api(`/api/workspaces/${workspace.id}/sessions`);
         const accepted = sessions.find((session) => session.requestKey === state.pendingStart.idempotencyKey);

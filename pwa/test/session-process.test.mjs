@@ -25,15 +25,21 @@ class ProcessFixtureScopes {
         const fields = (await readFile(`/proc/${saved.pid}/stat`, 'utf8')).split(')').slice(1).join(')').trim().split(/\s+/);
         if (fields[19] !== saved.start || Number(fields[2]) !== saved.group) throw new Error('Fixture identity changed');
         if (fields[0] !== 'Z') alive = true;
-      } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      // procfs can return ESRCH when a process exits between opening stat and reading it.
+      } catch (error) { if (!['ENOENT', 'ESRCH'].includes(error.code)) throw error; }
     }
     return { stopped: !alive, proof: 'test-only-process-identities' };
   }
   async stop(scope) {
-    const parent = JSON.parse(await readFile(path.join(scope.directory, 'parent.json'), 'utf8'));
-    if (!(await this.verify(scope)).stopped) { try { process.kill(-parent.group, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; } }
-    for (let n = 0; n < 200; n++) { const evidence = await this.verify(scope); if (evidence.stopped) return evidence; await sleep(10); }
-    throw new Error('Fixture termination timed out');
+    try {
+      const parent = JSON.parse(await readFile(path.join(scope.directory, 'parent.json'), 'utf8'));
+      if (!(await this.verify(scope)).stopped) { try { process.kill(-parent.group, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; } }
+      for (let n = 0; n < 200; n++) { const evidence = await this.verify(scope); if (evidence.stopped) return evidence; await sleep(10); }
+      throw new Error('Fixture termination timed out');
+    } catch (error) {
+      console.error('Process fixture cleanup failed:', error);
+      throw error;
+    }
   }
   async remove() {}
 }
@@ -67,7 +73,8 @@ for (const outcome of ['complete', 'stop']) test(`real process task survives HTT
     if (outcome === 'stop') assert.equal((await fetch(`${base}/api/workspaces/w1/sessions/${session.id}/stop`, { method: 'POST' })).status, 202);
     else await writeFile(path.join(scope, 'finish'), 'finish');
     await work;
-    assert.equal(server.sessions.store.raw(session.id).state, outcome === 'stop' ? 'INTERRUPTED' : 'COMPLETED');
+    const final = server.sessions.store.raw(session.id);
+    assert.equal(final.state, outcome === 'stop' ? 'INTERRUPTED' : 'COMPLETED', `Session reason: ${final.reason || '(none)'}`);
     await assert.rejects(fetch(`http://127.0.0.1:${info.port}`));
     assert.equal(server.sessions.store.db.prepare('SELECT COUNT(*) AS n FROM workspace_guards').get().n, 0);
   } finally {

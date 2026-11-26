@@ -58,16 +58,23 @@ export class SessionManager extends EventEmitter {
     if (input.threadId) await this.validateThread(workspace.path, input.threadId);
     await this.validateInput(input);
     await this.scopes.available();
-    const lock = await acquireLock(path.join(this.directory, 'handoff-locks'), workspace.id);
+    const lockDirectory = path.join(this.directory, 'handoff-locks');
+    // Serialize reservation with compatible SSH helpers until the durable guard
+    // has been committed. Tasks in unrelated workspaces can then run together.
+    const gate = await acquireLock(lockDirectory, 'workspace-hierarchy', { waitSeconds: 1 });
+    let lock;
     let reservation;
     try {
+      lock = await acquireLock(lockDirectory, workspace.id);
       // A pending transfer journal/checkpoint must be settled before another writer starts.
       const { assertTransferIdle } = await import('./transfer-readiness.mjs');
-      await assertTransferIdle(workspace.id);
+      await assertTransferIdle(workspace.id, workspace.path);
       if (this.draining) throw new SessionError('Controller is draining. No new task was started.', 503);
+      if (!gate.alive()) throw new SessionError('Workspace coordination lock was lost.');
       reservation = this.store.reserve({ owner, workspace, key: body.idempotencyKey, input, digest, bootId: this.boot });
       if (!reservation.created) { await lock.release(); return reservation.session; }
-    } catch (error) { await lock.release(); throw error; }
+    } catch (error) { await lock?.release(); throw error; }
+    finally { await gate.release(); }
     const active = { lock, scope: null, threadId: input.threadId, turnId: null, cancelTimer: null };
     this.active.set(reservation.session.id, active);
     active.watchdog = setInterval(async () => {

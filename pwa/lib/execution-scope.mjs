@@ -12,9 +12,10 @@ const wrapper = fileURLToPath(new URL('../../relay_lib/session_scope_exec.py', i
 const run = promisify(execFile);
 export async function bootId() { return (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim(); }
 
-export async function acquireLock(directory, name) {
+export async function acquireLock(directory, name, { waitSeconds = 0 } = {}) {
   await mkdir(directory, { recursive: true, mode: 0o700 });
-  const child = spawn('flock', ['-n', path.join(directory, `${name}.lock`), 'sh', '-c', 'printf ready; cat >/dev/null'], { stdio: ['pipe', 'pipe', 'ignore'] });
+  const mode = waitSeconds > 0 ? ['-w', String(waitSeconds)] : ['-n'];
+  const child = spawn('flock', [...mode, path.join(directory, `${name}.lock`), 'sh', '-c', 'printf ready; cat >/dev/null'], { stdio: ['pipe', 'pipe', 'ignore'] });
   child.stdin.on('error', () => {});
   return new Promise((resolve, reject) => {
     const failed = () => reject(new SessionError('Workspace or controller is busy.', 409, 'WORKSPACE_BUSY'));

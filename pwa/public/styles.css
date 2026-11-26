@@ -69,7 +69,14 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent);
 .conversation-row strong, .conversation-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conversation-row span { color: var(--muted); font-size: .89rem; }
 .conversation-row .conversation-status { color: var(--accent); font-size: .75rem; font-weight: 700; text-transform: uppercase; }
-.chat-panel { display: grid; flex: 1 1 auto; grid-template-rows: auto minmax(0, 1fr) auto auto auto auto; min-height: 0; }
+.chat-panel { display: grid; flex: 1 1 auto; grid-template-rows: auto auto minmax(0, 1fr) auto auto auto auto; min-height: 0; }
+.chat-panel > .chat-heading { grid-row: 1; }
+.chat-panel > #session-recovery { grid-row: 2; }
+.chat-panel > #message-list { grid-row: 3; }
+.chat-panel > #review-changes { grid-row: 4; }
+.chat-panel > #upload-list { grid-row: 5; }
+.chat-panel > #composer { grid-row: 6; }
+.chat-panel > #stop-turn { grid-row: 7; }
 #workspace-screen { display: flex; flex-direction: column; height: calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom)); min-height: 0; }
 .chat-heading { align-items: center; border-bottom: 1px solid var(--border); display: flex; gap: 8px; margin: 0 -24px; min-width: 0; padding: 7px 24px; }
 .chat-heading > div { display: grid; flex: 1; gap: 2px; min-width: 0; }
@@ -203,6 +210,6 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent);
 @media (max-width: 340px) { .panel-heading { flex-direction: column; gap: 14px; } .panel-heading .primary { align-self: flex-start; } .new-chat-settings { grid-template-columns: 1fr; } }
 @media (min-width: 700px) { .app-shell { padding-left: 36px; padding-right: 36px; } .topbar, .workspace-topbar, .chat-heading, .composer, .composer-note { margin-left: -36px; margin-right: -36px; padding-left: 36px; padding-right: 36px; } }
 
-.session-recovery { padding: 12px; background: #332516; border: 1px solid #a97735; border-radius: 8px; overflow-wrap: anywhere; }
+.session-recovery { padding: 12px; background: #332516; border: 1px solid #a97735; border-radius: 8px; max-height: min(35dvh, 18rem); overflow: auto; overflow-wrap: anywhere; }
 .session-recovery button { margin: 4px; padding: 8px; }
 .session-row { border-left: 3px solid var(--accent); }

@@ -16,7 +16,8 @@ async function fixture(work, options) {
 function reserve(store, overrides = {}) {
   const body = { text: 'private prompt', createdAt: Date.now(), idempotencyKey: randomUUID(), ...overrides };
   const { input, digest } = SessionStore.request(body);
-  return { ...store.reserve({ owner: 'owner', workspace: { id: overrides.workspaceId || 'w1', path: '/workspace' }, key: body.idempotencyKey, input, digest, bootId: 'boot' }), body, input, digest };
+  const id = overrides.workspaceId || 'w1';
+  return { ...store.reserve({ owner: 'owner', workspace: { id, path: overrides.workspacePath || (id === 'w1' ? '/workspace' : `/workspace-${id}`) }, key: body.idempotencyKey, input, digest, bootId: 'boot' }), body, input, digest };
 }
 test('atomic start deduplicates retries, rejects changed bodies and enforces workspace/controller limits', async () => fixture(async (store) => {
   const first = reserve(store);
@@ -28,6 +29,18 @@ test('atomic start deduplicates retries, rejects changed bodies and enforces wor
   assert.throws(() => reserve(store, { workspaceId: 'w3' }), /Two tasks/);
   assert.throws(() => store.get(first.session.id, 'other', 'w1'), /not found/);
   assert.throws(() => store.get(first.session.id, 'owner', 'other-workspace'), /not found/);
+}));
+test('parent and child tasks conflict while sibling workspaces remain independent', async () => fixture(async (store) => {
+  const parent = reserve(store, { workspaceId: 'parent', workspacePath: '/workspace/project' });
+  assert.throws(() => reserve(store, { workspaceId: 'child', workspacePath: '/workspace/project/nested' }), /overlapping workspace/);
+  const sibling = reserve(store, { workspaceId: 'sibling', workspacePath: '/workspace/project-other' });
+  store.transition(parent.session.id, 'UNCERTAIN');
+  assert.throws(() => reserve(store, { workspaceId: 'ancestor', workspacePath: '/workspace' }), /overlapping workspace/);
+  store.transition(parent.session.id, 'INTERRUPTED', null, { stopped: true });
+  store.transition(sibling.session.id, 'INTERRUPTED', null, { stopped: true });
+  const child = reserve(store, { workspaceId: 'child', workspacePath: '/workspace/project/nested' });
+  assert.throws(() => reserve(store, { workspaceId: 'parent-again', workspacePath: '/workspace/project' }), /overlapping workspace/);
+  store.transition(child.session.id, 'INTERRUPTED', null, { stopped: true });
 }));
 test('events, state and guard changes are transactional and only verified finalization unlocks', async () => fixture(async (store) => {
   const { session } = reserve(store);

@@ -46,10 +46,18 @@ const contexts = [], errors = [];
 async function context() { const value = await browser.newContext({ viewport: { width: 390, height: 844 } }); contexts.push(value); value.on('page', (page) => page.on('pageerror', (error) => errors.push(error.message))); return value; }
 async function waitForState(page, label) { await page.locator('#chat-status').filter({ hasText: label }).waitFor({ timeout: 15000 }); }
 try {
-  browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
+  browser = await chromium.launch({ headless: true, ...(process.env.RELAY_E2E_BROWSER_EXECUTABLE ? { executablePath: process.env.RELAY_E2E_BROWSER_EXECUTABLE } : {}), args: ['--no-sandbox'] });
   const first = await context(); let page = await first.newPage();
   await page.goto(base); await page.getByRole('button', { name: 'Open workspace' }).click(); await page.locator('#new-chat').click();
+  const gate = deferred();
+  await page.route('**/api/workspaces/*/sessions', async (route) => {
+    if (route.request().method() === 'POST') await gate.promise;
+    await route.continue();
+  });
   await page.locator('#prompt').fill('browser durability prompt'); await page.getByRole('button', { name: 'Send message' }).click();
+  await page.locator('.message.user').filter({ hasText: 'browser durability prompt' }).filter({ hasText: 'Sending…' }).waitFor({ timeout: 2000 });
+  assert.equal(starts, 0, 'Message is shown while the start request is still pending');
+  gate.resolve();
   await waitForState(page, 'Working on VM');
   await page.locator('#message-list').filter({ hasText: 'tick1' }).waitFor();
   await page.locator('#files-tab').click(); await page.getByRole('treeitem', { name: 'README.md' }).click();
@@ -57,10 +65,22 @@ try {
   await page.close();
   output += 'missed output\n'; emit({ type: 'delta', text: 'missed output\n', itemId: 'item-1' });
   assert.equal(interrupts, 0); assert.equal(starts, 1);
-  page = await first.newPage(); await page.goto(base);
+  page = await first.newPage();
+  const listGate = deferred();
+  await page.route('**/api/workspaces/*/conversations', async (route) => { await listGate.promise; await route.continue().catch(() => {}); });
+  await page.goto(base);
   await page.locator('#message-list').filter({ hasText: 'missed output' }).waitFor();
+  listGate.resolve();
   assert.equal((await page.locator('.message.user .message-content').allTextContents()).filter((text) => text === 'browser durability prompt').length, 1);
   assert.equal(((await page.locator('#message-list').innerText()).match(/tick1/g) || []).length, 1);
+  await first.setOffline(true);
+  await page.locator('#chat-status').filter({ hasText: 'Offline' }).waitFor({ timeout: 5000 });
+  output += 'offline output\n'; emit({ type: 'delta', text: 'offline output\n', itemId: 'item-1' });
+  const reconnected = page.waitForResponse((response) => response.url().includes('/sessions/') && response.url().includes('/events?') && response.status() === 200, { timeout: 15000 });
+  await first.setOffline(false);
+  await reconnected;
+  await page.locator('.message.assistant .message-content[data-markdown]').filter({ hasText: 'offline output' }).waitFor({ timeout: 15000 });
+  assert.equal(((await page.locator('#message-list').innerText()).match(/offline output/g) || []).length, 1);
   const second = await context(), other = await second.newPage(); await other.goto(base);
   await other.getByRole('button', { name: 'Open workspace' }).click(); await other.locator('.session-row').first().click();
   await other.locator('#message-list').filter({ hasText: 'missed output' }).waitFor(); assert.equal(starts, 1);
@@ -68,7 +88,19 @@ try {
   assert.equal(interrupts, 1);
   await page.reload(); await waitForState(page, 'Stopped');
   assert.equal(((await page.locator('#message-list').innerText()).match(/tick1/g) || []).length, 1);
+  await page.unroute('**/api/workspaces/*/sessions');
+  const rejectStart = async (route) => {
+    if (route.request().method() === 'POST') await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'Fixture start failure' }) });
+    else await route.continue();
+  };
+  await page.route('**/api/workspaces/*/sessions', rejectStart);
+  await page.locator('#prompt').fill('recovery fixture'); await page.getByRole('button', { name: 'Send message' }).click();
+  await page.locator('.message.user').filter({ hasText: 'recovery fixture' }).filter({ hasText: 'Not confirmed' }).waitFor();
+  assert.equal(await page.locator('#prompt').inputValue(), 'recovery fixture', 'Failed send preserves the draft');
+  assert.equal(starts, 1, 'Rejected start did not create an execution');
+  await page.unroute('**/api/workspaces/*/sessions', rejectStart);
   await page.locator('#prompt').fill('recovery fixture'); await page.getByRole('button', { name: 'Send message' }).click(); await waitForState(page, 'Working on VM');
+  assert.equal(await page.locator('.message.user').filter({ hasText: 'recovery fixture' }).count(), 1, 'Retry does not duplicate the failed message');
   scopes.failStop = true; complete.resolve({ status: 'completed' });
   await page.locator('#session-recovery').waitFor(); assert.equal(await page.locator('#prompt').isDisabled(), true);
   scopes.failStop = false; await page.locator('#recover-terminate').click(); await waitForState(page, 'Stopped');

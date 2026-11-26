@@ -1,6 +1,6 @@
 # Relay — Open Problems and Validation Backlog
 
-**Last reviewed:** 24 November 2026 (V1.4 additions; older entries retain their historical status)
+**Last reviewed:** 25 November 2026 (older entries retain their historical status except where updated below)
 
 This is the working list of problems found while testing the Mac → VM → phone
 workflow. A problem is closed only after it has reproducible test evidence; a
@@ -16,6 +16,35 @@ design idea alone is not a fix.
   implementation claim.
 
 ## P0 — Sync correctness and safety
+
+### RLY-025 · Overlapping workspace paths do not share execution guards
+
+**Status:** Partially mitigated in candidate — handoff overlap remains unsafe
+
+Workspace identity is derived from its exact path. The PWA can list a configured
+root and also register a directory beneath it, but session reservations and
+handoff locks are keyed by workspace ID. An active task in the parent and a task
+or transfer in the child can therefore address the same files under different
+guards. The durable guard query also checks the exact ID, not overlapping paths.
+An isolated store accepted simultaneous reservations for `/tmp/example` and
+`/tmp/example/child`; no live workspace was modified in that reproduction.
+The session store rejects overlapping active or uncertain task reservations while
+allowing siblings; a real nested task and SSH import were refused while the parent
+task was writing. The candidate PWA and updated local SSH helper also use a shared
+reservation gate and inspect pending checkpoints across overlapping paths. A
+Playwright test failed against the old candidate (task incorrectly accepted while
+the SSH gate was held) and passed after the candidate update. Cross-language and
+pending-state fixtures also pass. Crash during lock acquisition, legacy helpers,
+path identity, and broader recovery remain release blockers; do not close this item.
+
+**Required fix:** coordinate canonical ancestor/descendant paths across session
+reservation, capture, push, pull, checkpoint mutation, recovery, and controller
+downtime without serializing unrelated sibling workspaces unnecessarily. Cover
+concurrent starts, transfer races, symlink/path identity, crashes, old desktop
+helpers, and terminal/uncertain states with cross-process tests. Until verified,
+do not use overlapping workspaces concurrently or hand off either while a task
+in the other is active. The isolated test service currently lists its parent test
+root and registered child fixtures, so this limitation applies there too.
 
 ### RLY-001 · There is no phone-requested Mac → VM sync
 
@@ -70,47 +99,50 @@ requirement that the destination path is absent, including an empty directory.
 
 ### RLY-004 · Push conflict semantics need a formal preflight
 
-**Status:** Partially proven
+**Status:** Implemented for paired workspace handoffs; legacy and broader validation remain open
 
 `relay push` can capture Git state, patches, and untracked files including
 Git-ignored files, apart from excluded dependency/cache directories.
-The system still needs an explicit remote-handoff preflight when the VM has
-changed since the last synchronized snapshot.
+Paired plain and Git handoffs compare each endpoint with the saved checkpoint;
+diverged changes are refused or sent through the reviewed merge workflow.
+The legacy `--project` path remains separate from that paired protocol.
 
 **Failure path:** a Mac-originated push could overwrite newer Codex work on the
 VM if the remote is treated as an unconditional restore target.
 
-**Required fix:** compare the current VM manifest/snapshot to the recorded
-handoff before restore. Require an explicit conflict decision or a separate
-three-way merge workflow.
+**Remaining work:** validate the preflight and recovery on the remaining target
+platforms and keep the legacy path's guarantees clearly separated.
 
-### RLY-014 · Diverged Mac and VM commits have no resolution workflow
+### RLY-014 · Diverged Mac and VM commit resolution needs broader validation
 
-**Status:** Current limitation
+**Status:** Reviewed history workflow implemented; broader validation open
 
-The legacy handoff records a checkpoint and transfers file-tree deltas; it does
-not automatically merge two independently created Git commits. First import
-restores the VM's captured HEAD into a separate new directory. The legacy
-pull checks the local base, but this is not a complete divergence-resolution
-protocol for both histories.
+The legacy handoff does not merge independently created commits. The paired
+workspace protocol provides an explicit reviewed history workflow; it still
+needs the platform and physical-phone validation listed below.
 
 **Failure path:** a developer commits Mac work, Codex commits VM work, and the
 two histories become sibling commits. A normal Git merge may require a
 same-line conflict, and automatically choosing either version could lose work.
 
-**Required fix:** add an explicit divergence-resolution flow that preserves
-both snapshots, presents per-file/base-Mac-VM diffs, allows a user to resolve
-conflicts, verifies the resolved tree, and only then writes a new shared Relay
-checkpoint. Do not silently merge, rebase, or advance a checkpoint.
+**Current support:** `relay merge` retains snapshots and provides a private
+history-review repository. A reviewed commit descending from both heads must be
+explicitly approved before publication. Local fixtures cover divergent history;
+manual phone and cross-platform acceptance remain open. Do not silently merge,
+rebase, or advance a checkpoint.
 
 ### RLY-012 · Repeat handoff support is incomplete
 
-**Status:** Plain-folder multi-file round trip exercised; Git repeat sync open
+**Status:** Plain and Git repeat handoffs implemented and exercised over SSH; broader acceptance open
 
 A destination-specific, journaled plain-folder push and repeat pull completed a
-RAG workspace cycle. Git repeat push/pull, automatic conflict resolution and
-broader platform verification remain unsupported. Legacy first-handoff Git push
-still refuses an existing target.
+RAG workspace cycle. Git repeat push/pull preserves the index and working tree;
+reviewed merge and explicit commit transfer are supported for eligible states.
+On 25 November, isolated real SSH fixtures passed two plain and Git round trips,
+divergence refusal, interrupted transfer recovery and dropped-ack recovery. The
+Git fixture tested a non-overlapping merge and explicit commit transfer. Native
+macOS and full physical-phone acceptance remain open. Legacy first-handoff Git
+push still refuses an existing target.
 
 **Failure path:** treating an existing VM workspace as an unconditional restore
 target could discard phone or local work.
@@ -184,12 +216,12 @@ encryption, and artifacts are not automatically expired or quota-limited.
 cleanup, preserve the last necessary recovery point, and test disk-full paths.
 Do not silently exclude project runtime files.
 
-### RLY-019 · File types, cross-filesystem and Git repeat support are limited
+### RLY-019 · File types and cross-filesystem handoffs are limited
 
 **Status:** Open
 
 The paired batch path supports plain workspaces with regular files and supported
-directories. Git repeat sync, symlinks, special files, file/directory type
+directories, and Git repeat sync supports eligible repositories. Symlinks, special files, file/directory type
 transitions and cross-filesystem VM publication remain unsupported and must
 fail explicitly. Local excluded directories are preserved on pull only when
 they contain supported types.
@@ -222,9 +254,35 @@ live database captures.
 
 ## P1 — Phone and PWA reliability
 
+### RLY-027 · Recovery buttons overlapped by long messages on mobile
+
+**Status:** Fixed in test candidate; physical-phone verification remains
+
+A Playwright real-VM crash test showed the message list covering the recovery
+buttons at a 390 × 844 viewport. A long-message crash fixture reproduced the
+failure before the fix. The chat layout now assigns fixed grid rows to recovery,
+messages, and composer controls; the fixture and real-VM recheck passed after
+the change. Validate on physical devices before closing the item.
+
+### RLY-026 · Process cleanup fixture intermittently reports UNCERTAIN
+
+**Status:** Fixture fix implemented and exercised; production cleanup remains covered by RLY-023
+
+On 25 November, the full Node suite's real-process completion fixture reported
+`UNCERTAIN` instead of `COMPLETED`; its isolated rerun and a subsequent full
+suite passed. A later Stop fixture also failed intermittently. The captured
+failure was an `ESRCH` from reading a procfs stat file while the test
+process exited. The injected test fixture now treats that result like a missing
+process. Four concurrent reruns of the real-process fixture passed. This changes
+only the test fixture; production cgroup checks were not relaxed.
+
+**Remaining work:** retain diagnostics and continue production cgroup and real
+Codex cleanup verification under RLY-023; reopen this issue if the fixture fails
+again for this or another reason.
+
 ### RLY-022 · Sent messages appear late in the chat
 
-**Status:** Open — reproduced in the V1.4 candidate
+**Status:** Partially fixed — candidate verified; phone and reopen latency remain open
 
 On 24 November, two phone-sized Playwright runs measured 1.39–1.54 seconds
 from Send to backend acceptance and 3.04–3.14 seconds until the user's message
@@ -242,20 +300,37 @@ real candidate and add deterministic browser tests for slow and failed requests.
 after browser closure, and 46 backend text events matched both browser views.
 That pass does not establish an acceptable Send latency or physical-phone behavior.
 
+On 25 November, the candidate showed an optimistic message with a Sending state;
+one live phone-sized browser run showed it in 106 ms and acceptance in 1,662 ms.
+The test continued after closing the app and matched backend events in two
+reopened browsers. The rendered fixture holds and rejects the start request to
+check immediate feedback, preserved draft, and retry without duplicates. Session
+restoration no longer waits for the workspace conversation list, and a browser
+fixture verifies replay while that list is held. Physical-phone timing, slower
+uploads and other session-history/model request delays remain to be verified.
+On 26 November, an offline Playwright test first failed because no offline state
+was displayed. The candidate now shows Offline and reopens the event stream when
+network access returns. A live browser test confirmed the heartbeat advanced and
+both browsers replayed the backend output. Physical-phone behavior remains open.
+
 ### RLY-023 · V1.4 release-level session and handoff tests remain incomplete
 
 **Status:** Open — candidate and partial browser verification only
 
-The real candidate passed a delegated-cgroup detached-child fixture and a
-phone-sized Chromium close/reopen run with two subscribers, a running heartbeat,
-and matching backend/frontend text. Remaining tests include:
+The candidate passed a two-minute browser closure without an event subscriber,
+browser-simulated offline/reconnect, Stop during writes, guarded initial plain
+and Git import, and preview cleanup on Stop. A separate
+transient VM controller passed a real Codex crash test: SSH was blocked while
+the controller was absent and an unverified recovery stayed blocked after restart.
+These do not substitute for a physical phone or exhaustive crash tests. Remaining
+tests include:
 
 - A physical phone: lock or close for at least two minutes, airplane-mode
   interruption, reconnect, output replay, and no duplicate prompt or message.
-- Explicit Stop during writes and disconnection; verify termination and bytes,
-  and check handoffs refuse during cancellation and succeed afterward.
-- Paired desktop Git and plain handoffs with the candidate's matching controller
-  state and helper, including active-task refusal and repeat/merge recovery.
+- Verify handoffs during cancellation itself; the tested workflow covered an
+  active task and the state after confirmed Stop.
+- Paired desktop Git and plain repeat handoffs and merge recovery with the
+  candidate's matching controller state and helper.
 - Dedicated-controller crash, orphaned or detached writer, uncertainty, audited
   recovery, stale identity, and storage-failure cases with actual cgroups and
   real Codex. A mocked process driver is not production containment evidence.
@@ -269,18 +344,25 @@ evidence, and receipts without exposing private output. See
 
 ### RLY-024 · Candidate workspace registry is shared with the live PWA
 
-**Status:** Open — test-service isolation incomplete
+**Status:** Candidate registry and configured helper verified for guarded initial plain and Git imports; broader coverage remains
 
-The candidate uses a separate controller state and test workspace root but still
-reads the default live workspace registry. Existing VM workspaces therefore
-appear in its workspace list. Its independent session guards do not coordinate
-with the live controller for those projects.
+The original test configuration used a separate controller state and test root
+but read the live workspace registry. The candidate now has a separate registry.
+Independent controller guards still must not be used for the same workspace.
 
 **Required fix:** give the candidate a separate `RELAY_WORKSPACE_REGISTRY_FILE`,
 verify only disposable workspaces are listed, and use matching candidate state
 for the desktop helper. Drain candidate tasks before changing or restarting its
 service. Do not run both controllers against the same workspace with independent
 guards.
+
+On 25 November, the candidate service was configured with a separate registry,
+and its workspace list showed only disposable roots. The live service remained
+active. The updated desktop helper accepts an explicit complete remote controller
+configuration; against the real candidate it refused plain and Git imports while
+Codex tasks were writing and imported after verified Stop. Repeat transfers under
+the candidate guard remain unverified. Old helpers and arbitrary same-user SSH
+remain outside this supported boundary.
 
 ### RLY-005 · Preview URLs depend on a fragile development-server contract
 
@@ -299,6 +381,11 @@ link rather than the site.
 bounded readiness retry, require `127.0.0.1`/`::1`, verify HTTP locally, and
 show the exact listener/error state in the PWA. Never use Tailscale Funnel or a
 public `0.0.0.0` listener.
+
+**26 November evidence:** a Playwright test started a real task-owned loopback
+server, opened a private preview, closed and reopened the browser, and confirmed
+the server and its route were removed before Stop completed. Completion/failure
+cleanup and unrelated-server cases remain open.
 
 ### RLY-006 · Phone cannot yet request a controlled terminal session
 
@@ -403,14 +490,22 @@ resource quotas, and immediate revocation.
 
 ## Verification queue
 
-1. Exercise crash and retry boundaries for both endpoints on a separate
-   disposable VM and on native macOS and Linux.
-2. Validate multi-file publication, local exclusions, conflicting edits,
-   disk-full behavior and external-writer coordination.
-3. Reduce repeat-pull transfer volume without weakening verification.
-4. Add artifact encryption, quotas and safe retention/cleanup.
-5. Validate Qdrant and PostgreSQL application-consistent backup and restore.
-6. Verify private preview readiness and keep multi-tenant isolation separate.
+1. Close the overlapping-path start/transfer race (RLY-025) before claiming
+   workspace guard safety; retain conservative recovery when evidence is missing.
+2. Finish V1.4 acceptance (RLY-023): real Codex crash/recovery, paired Git and
+   plain handoffs under the candidate guard, preview cleanup, and physical-phone
+   offline/reconnect and Stop checks. Monitor the cleanup fixture fix (RLY-026)
+   and verify remaining UI/phone timing (RLY-022).
+3. Exercise crash and retry boundaries, disk-full behavior and external-writer
+   coordination on a separate disposable VM and native macOS/Linux (RLY-003,
+   RLY-004, RLY-012, RLY-014–016, RLY-019–020).
+4. Design incremental repeat pull and secure artifact retention (RLY-017–018),
+   and validate application-consistent database backup/restore (RLY-021).
+5. Address product work separately: controlled phone sync/terminal, durable
+   ownership, model compatibility, environment handoff and CLI packaging
+   (RLY-001–002, RLY-006–009, RLY-013). Validate preview readiness (RLY-005).
+6. Keep multi-user onboarding and Firecracker isolation gated until their
+   dedicated architecture and security validation are complete (RLY-010–011).
 
 ## Closed / do not re-open without a new reproduction
 

@@ -44,6 +44,26 @@ class ImportPreviewTests(unittest.TestCase):
     def run_push(self, project, path, *extra):
         return subprocess.run([str(RELAY), 'push', '--workspace', self.workspace_id, '--project', str(project), '--file', path, '--json', *extra], env=self.env, capture_output=True, text=True)
 
+    def test_custom_remote_controller_is_used_for_capture_guards(self):
+        controller = self.base / 'candidate state'
+        controller.mkdir()
+        (controller / 'sessions-required').write_text('1')
+        self.env.update({
+            'RELAY_REMOTE_CONTROLLER_STATE_DIR': str(controller),
+            'RELAY_REMOTE_WORKSPACE_REGISTRY_FILE': str(self.base / 'registry.json'),
+            'RELAY_REMOTE_WORKSPACE_ROOTS': str(self.source),
+        })
+        result = self.run_relay('--workspace', self.workspace_id, '--into', str(self.dest), '--json')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('source_busy', result.stdout)
+        self.assertFalse((self.dest / 'source').exists())
+
+    def test_partial_remote_controller_configuration_is_rejected(self):
+        self.env['RELAY_REMOTE_CONTROLLER_STATE_DIR'] = str(self.base / 'controller')
+        result = self.run_relay('--workspace', self.workspace_id, '--into', str(self.dest), '--json', '--dry-run')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Set all three', result.stdout)
+
     def test_plain_policy_import_and_update_preserve_excluded_file(self):
         (self.source / '.relayignore').write_text('exclude secret\n')
         (self.source / 'secret').write_text('VM secret')

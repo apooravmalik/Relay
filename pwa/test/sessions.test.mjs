@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, realpath } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import test from 'node:test';
 import { SessionManager } from '../lib/sessions.mjs';
 import { FixtureScopes, deferred } from './fixtures/session-fixtures.mjs';
@@ -37,6 +39,34 @@ test('server-owned execution survives zero subscribers, deduplicates retry and c
   complete.resolve({ status: 'interrupted' }); await work;
   assert.equal(manager.store.raw(session.id).state, 'INTERRUPTED');
   assert.equal(manager.store.db.prepare('SELECT COUNT(*) AS n FROM workspace_guards').get().n, 0);
+}));
+test('a running handoff gate prevents a task reservation until the handoff releases it', async () => fixture(async ({ manager, started, complete, workspace, body, starts }) => {
+  const code = "import sys\nfrom relay_lib.export_workspace import turn_lock\nwith turn_lock('other-workspace', sys.argv[1]):\n print('ready', flush=True)\n sys.stdin.read()";
+  const helper = spawn('python3', ['-c', code, workspace.path], { env: { ...process.env, RELAY_CONTROLLER_STATE_DIR: manager.directory, HOME: workspace.path }, stdio: ['pipe', 'pipe', 'pipe'] });
+  try {
+    const [ready] = await Promise.race([once(helper.stdout, 'data'), once(helper, 'exit').then(() => { throw new Error('Python handoff fixture exited before acquiring the gate.'); })]);
+    assert.equal(String(ready).trim(), 'ready');
+    await assert.rejects(manager.start('owner', workspace, body), /busy/);
+    assert.equal(starts(), 0);
+    assert.equal(manager.store.db.prepare('SELECT COUNT(*) AS n FROM workspace_guards').get().n, 0);
+  } finally { helper.stdin.end(); if (helper.exitCode === null && helper.signalCode === null) await once(helper, 'exit'); }
+  const session = await manager.start('owner', workspace, body);
+  await started.promise;
+  const work = manager.active.get(session.id).work;
+  complete.resolve({ status: 'completed' }); await work;
+  assert.equal(manager.store.raw(session.id).state, 'COMPLETED');
+}));
+test('simultaneous starts in sibling workspaces both reserve successfully', async () => fixture(async ({ manager, complete, workspace, body }) => {
+  const firstPath = path.join(workspace.path, 'first'), secondPath = path.join(workspace.path, 'second');
+  await mkdir(firstPath); await mkdir(secondPath);
+  const [first, second] = await Promise.all([
+    manager.start('owner', { id: 'first', path: firstPath }, body),
+    manager.start('owner', { id: 'second', path: secondPath }, { ...body, idempotencyKey: randomUUID() }),
+  ]);
+  assert.notEqual(first.id, second.id);
+  assert.equal(manager.store.db.prepare('SELECT COUNT(*) AS n FROM workspace_guards').get().n, 2);
+  complete.resolve({ status: 'completed' });
+  await Promise.all([...manager.active.values()].map((entry) => entry.work));
 }));
 test('server cleanup precedes terminal state and failed cleanup quarantines the workspace', async () => fixture(async ({ manager, scopes, started, complete, workspace, body }) => {
   const session = await manager.start('owner', workspace, body); await started.promise;

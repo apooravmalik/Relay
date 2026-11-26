@@ -15,6 +15,13 @@ const transitions = {
   UNCERTAIN: ['FAILED', 'INTERRUPTED'],
 };
 function syncDirectory(directory) { const fd = openSync(directory, 'r'); try { fsyncSync(fd); } finally { closeSync(fd); } }
+function overlaps(a, b) {
+  const within = (parent, child) => {
+    const relative = path.relative(parent, child);
+    return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+  };
+  return within(a, b) || within(b, a);
+}
 
 export class SessionStore {
   constructor(directory, { now = Date.now, maxSessionBytes = 64 * 1024 ** 2, maxTotalBytes = 1024 ** 3, requiredMarker } = {}) {
@@ -109,6 +116,8 @@ export class SessionStore {
       if (prior) return { session: prior, created: false };
       if (input.createdAt < this.now() - day || input.createdAt > this.now() + 60000) throw new SessionError('This request is stale. Review the conversation before sending a new prompt.', 410, 'STALE_REQUEST');
       if (this.db.prepare('SELECT 1 FROM workspace_guards WHERE workspace_id=?').get(workspace.id) || this.db.prepare("SELECT 1 FROM sessions WHERE workspace_id=? AND state NOT IN ('COMPLETED','FAILED','INTERRUPTED')").get(workspace.id)) throw new SessionError('Workspace has active or uncertain execution.');
+      const guarded = this.db.prepare("SELECT s.workspace_path FROM sessions s LEFT JOIN workspace_guards g ON g.session_id=s.id WHERE g.session_id IS NOT NULL OR s.state NOT IN ('COMPLETED','FAILED','INTERRUPTED')").all();
+      if (guarded.some((row) => overlaps(row.workspace_path, workspace.path))) throw new SessionError('An overlapping workspace has active or uncertain execution.');
       if (this.db.prepare('SELECT COUNT(*) AS n FROM workspace_guards').get().n >= 2) throw new SessionError('Two tasks are already active or uncertain. Finish or recover one first.');
       if (this.db.prepare('SELECT COALESCE(SUM(event_bytes),0) AS n FROM sessions').get().n > this.maxTotalBytes - 65536) throw new SessionError('Session storage budget is full. No new task was started.', 507);
       const id = randomUUID(), now = this.now();

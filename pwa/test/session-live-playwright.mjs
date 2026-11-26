@@ -12,7 +12,11 @@ if (!modulePath || !base || !workspaceId || process.env.RELAY_E2E_DISPOSABLE !==
 const { chromium } = await import(pathToFileURL(modulePath));
 const marker = `relay-e2e-${randomUUID()}`;
 const filename = `${marker}.txt`;
-const prompt = `In this disposable workspace run one foreground Python command that writes the numbers 1 through 30, one per line, to ${filename}, flushing each line and sleeping 2 seconds between lines. Wait for the command to finish, then reply exactly ${marker} done. Do not change any other file or start a background process.`;
+const closedMs = Number(process.env.RELAY_E2E_CLOSED_MS || 6000);
+const offlineMs = Number(process.env.RELAY_E2E_OFFLINE_MS || 6000);
+if (![closedMs, offlineMs].every((value) => Number.isSafeInteger(value) && value >= 0 && value <= 600000)) throw new Error('Browser closure and offline durations must be between 0 and 600000 ms.');
+const samples = Math.max(30, Math.ceil((closedMs + offlineMs + 60000) / 2000));
+const prompt = `In this disposable workspace run one foreground Python command that writes the numbers 1 through ${samples}, one per line, to ${filename}, flushing each line and sleeping 2 seconds between lines. Wait for the command to finish, then reply exactly ${marker} done. Do not change any other file or start a background process.`;
 const browser = await chromium.launch({ headless: true, ...(executablePath ? { executablePath } : {}), args: ['--no-sandbox'] });
 const first = await browser.newContext({ viewport: { width: 390, height: 844 } });
 const observer = await browser.newContext({ viewport: { width: 390, height: 844 } });
@@ -29,6 +33,33 @@ async function countLines() {
   const response = await observer.request.get(new URL(`/api/workspaces/${workspaceId}/browse-file?path=${encodeURIComponent(filename)}`, base).href);
   if (!response.ok()) return 0;
   const value = await response.json(); return (value.content || '').split(/\\n|\r?\n/).map((line) => line.trim()).filter((line) => /^\d+$/.test(line)).length;
+}
+async function observeBackend(sessionId) {
+  const backendPage = await observer.newPage();
+  await backendPage.goto(base, { waitUntil: 'domcontentloaded' });
+  await backendPage.evaluate(({ workspaceId, sessionId }) => {
+    window.relayEvents = [];
+    window.relayStreamError = null;
+    void (async () => {
+      const res = await fetch(`/api/workspaces/${workspaceId}/sessions/${sessionId}/events?after=0`);
+      if (!res.ok) throw new Error(`Event stream HTTP ${res.status}`);
+      const reader = res.body.getReader(), decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        buffer += decoder.decode(value || new Uint8Array(), { stream: !done }).replace(/\r/g, '');
+        let end;
+        while ((end = buffer.indexOf('\n\n')) >= 0) {
+          const frame = buffer.slice(0, end); buffer = buffer.slice(end + 2);
+          const kind = frame.match(/^event: (.*)$/m)?.[1];
+          const data = frame.split('\n').filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trimStart()).join('\n');
+          if (data) window.relayEvents.push({ type: kind, data: JSON.parse(data), at: Date.now() });
+        }
+        if (done) break;
+      }
+    })().catch((error) => { window.relayStreamError = error.message; });
+  }, { workspaceId, sessionId });
+  return backendPage;
 }
 try {
   page = await first.newPage(); page.on('pageerror', (error) => errors.push(error.message));
@@ -55,30 +86,6 @@ try {
   const response = await accepted; assert.equal(response.status(), 202, 'Session start must be accepted');
   const acceptedAt = Date.now();
   session = (await response.json()).session;
-  const backendPage = await observer.newPage();
-  await backendPage.goto(base, { waitUntil: 'domcontentloaded' });
-  await backendPage.evaluate(({ workspaceId, sessionId }) => {
-    window.relayEvents = [];
-    window.relayStreamError = null;
-    void (async () => {
-      const res = await fetch(`/api/workspaces/${workspaceId}/sessions/${sessionId}/events?after=0`);
-      if (!res.ok) throw new Error(`Event stream HTTP ${res.status}`);
-      const reader = res.body.getReader(), decoder = new TextDecoder();
-      let buffer = '';
-      while (true) {
-        const { value, done } = await reader.read();
-        buffer += decoder.decode(value || new Uint8Array(), { stream: !done }).replace(/\r/g, '');
-        let end;
-        while ((end = buffer.indexOf('\n\n')) >= 0) {
-          const frame = buffer.slice(0, end); buffer = buffer.slice(end + 2);
-          const kind = frame.match(/^event: (.*)$/m)?.[1];
-          const data = frame.split('\n').filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trimStart()).join('\n');
-          if (data) window.relayEvents.push({ type: kind, data: JSON.parse(data), at: Date.now() });
-        }
-        if (done) break;
-      }
-    })().catch((error) => { window.relayStreamError = error.message; });
-  }, { workspaceId, sessionId: session.id });
   await page.locator('.message.user .message-content').filter({ hasText: prompt }).waitFor({ timeout });
   const sendTiming = await page.evaluate(() => window.relayTiming);
   assert.ok(sendTiming.userVisible, 'Sent message became visible');
@@ -87,17 +94,28 @@ try {
   await waitFor(async () => (await page.evaluate(() => JSON.parse(localStorage.getItem('relay-session-selection') || 'null')))?.sessionId === session.id, 'session selection to persist');
   const before = await countLines();
   await page.close();
-  const after = await waitFor(async () => { const n = await countLines(); return n >= before + 3 ? n : 0; }, 'heartbeat to advance while the app is closed', 45000);
-  console.log(`PASS: closed app while heartbeat advanced from ${before} to ${after}; session ${session.id}`);
+  const closedAt = Date.now();
+  const after = await waitFor(async () => { const n = await countLines(); return Date.now() - closedAt >= closedMs && n >= before + 3 ? n : 0; }, 'heartbeat to advance while the app is closed', closedMs + 45000);
+  console.log(`PASS: app closed for ${Date.now() - closedAt} ms while heartbeat advanced from ${before} to ${after}; session ${session.id}`);
   page = await first.newPage(); page.on('pageerror', (error) => errors.push(error.message));
   await page.goto(base, { waitUntil: 'domcontentloaded' });
   await page.locator('#message-list').getByText(prompt, { exact: true }).waitFor({ timeout });
   const selection = await page.evaluate(() => JSON.parse(localStorage.getItem('relay-session-selection')));
   assert.equal(selection.sessionId, session.id, 'Reopened the original session');
+  const beforeOffline = await countLines();
+  await first.setOffline(true);
+  const offlineAt = Date.now();
+  await page.locator('#chat-status').filter({ hasText: 'Offline' }).waitFor({ timeout: 30000 });
+  const duringOffline = await waitFor(async () => { const n = await countLines(); return Date.now() - offlineAt >= offlineMs && n >= beforeOffline + 3 ? n : 0; }, 'heartbeat to advance while the browser is offline', offlineMs + 45000);
+  await first.setOffline(false);
+  await page.locator('#chat-status').filter({ hasText: /Working|Completed/ }).waitFor({ timeout: 30000 });
+  assert.equal((await page.evaluate(() => JSON.parse(localStorage.getItem('relay-session-selection')))).sessionId, session.id);
+  console.log(`PASS: browser went offline while heartbeat advanced from ${beforeOffline} to ${duringOffline}, then reconnected to the same session`);
   const other = await observer.newPage(); await other.goto(base, { waitUntil: 'domcontentloaded' });
   await other.evaluate((selection) => localStorage.setItem('relay-session-selection', JSON.stringify(selection)), selection);
   await other.reload({ waitUntil: 'domcontentloaded' });
   await other.locator('#message-list').getByText(prompt, { exact: true }).waitFor({ timeout });
+  const backendPage = await observeBackend(session.id);
   for (const tab of [page, other]) await tab.evaluate(() => {
     window.relayRenderTimes = [];
     const record = () => { const text = [...document.querySelectorAll('.message.assistant .message-content')].map((node) => node.dataset.markdown || '').join(''); window.relayRenderTimes.push({ text, at: Date.now() }); };
@@ -130,13 +148,23 @@ try {
     console.log(`TIMING: browser ${index + 1} complete output vs last backend delta ${finalRender.at - deltas.at(-1).at} ms (negative means browser received it first)`);
   }
   console.log(`PASS: ${deltas.length} backend text events matched both browser transcripts in order`);
-  assert.equal((await countLines()), 30, 'All heartbeat lines were written');
+  assert.equal((await countLines()), samples, 'All heartbeat lines were written');
   assert.equal(await page.locator('.message.user .message-content').filter({ hasText: prompt }).count(), 1, 'Prompt is not duplicated after reconnect');
   const sessions = (await json(observer, `/api/workspaces/${workspaceId}/sessions`)).sessions;
   assert.equal(sessions.filter((item) => item.id === session.id).length, 1);
   assert.deepEqual(errors, []);
   console.log(`PASS: same session reopened in two browsers, finished, and displayed its reply; heartbeat file ${filename}`);
 } finally {
+  if (session) {
+    try {
+      const url = `/api/workspaces/${workspaceId}/sessions/${session.id}`;
+      const state = (await json(observer, url)).session.state;
+      if (['STARTING', 'RUNNING', 'CANCEL_REQUESTED'].includes(state)) {
+        await observer.request.post(new URL(`${url}/stop`, base).href);
+        await waitFor(async () => !['STARTING', 'RUNNING', 'CANCEL_REQUESTED'].includes((await json(observer, url)).session.state), 'test task to stop', 45000);
+      }
+    } catch { console.error(`Could not verify cleanup of test session ${session.id}; inspect it before retrying.`); }
+  }
   await first.close(); await observer.close(); await browser.close();
   if (session) console.log(`Test session ${session.id}; test file ${filename} remains in the disposable workspace.`);
 }
