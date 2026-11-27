@@ -413,7 +413,7 @@ def main(argv=None):
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
         text = str(exc)
         code, sep, detail = text.partition(': ')
-        if sep and code in ('workspace_not_found', 'unsupported_git_state', 'unsupported_policy', 'invalid_policy', 'policy_mismatch', 'excluded_tracked_file', 'unsupported_file', 'source_changed', 'source_busy', 'permission_denied', 'secret_detected', 'scan_limit', 'helper_upgrade_required'):
+        if sep and code in ('workspace_not_found', 'unsupported_git_state', 'unsupported_policy', 'invalid_policy', 'policy_mismatch', 'excluded_tracked_file', 'unsupported_file', 'source_changed', 'source_busy', 'writer_unverified', 'writer_conflict', 'permission_denied', 'secret_detected', 'scan_limit', 'helper_upgrade_required'):
             return fail(args, code, detail)
         return fail(args, 'import_failed', text)
 

@@ -23,7 +23,7 @@ const exec = promisify(execFile);
 const hash = (value) => createHash('sha256').update(value).digest('hex');
 const quote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
 const side = (file) => path.join(directory, file);
-const workspaces = ['before', 'after', 'rollback', 'git-after'].map((name) => {
+const workspaces = ['before', 'after', 'rollback', 'git-after', 'writer'].map((name) => {
   const root = side(name);
   return { id: hash(root).slice(0, 16), name, path: root, status: 'ready', gitAvailable: name === 'git-after', branch: name === 'git-after' ? 'main' : null };
 });
@@ -85,13 +85,43 @@ try {
     'import os, signal, sys',
     'sys.path.insert(0, ' + JSON.stringify(repo) + ')',
     'from relay_lib import export_workspace as e',
+    'import subprocess',
     'original = e._workspace_exchange',
+    'checkpoint = e.checkpoint',
+    'def save_before_ack(root, workspace, request):',
+    "    if request['action'] == 'commit':",
+    "        transfer = request['transfer_id']",
+    "        previous = e._batch_directory(transfer) / 'previous' / 'one.txt'",
+    '        subprocess.run([sys.executable, ' + JSON.stringify(side('writer.py')) + ', str(previous), ' +
+      JSON.stringify(side('writer-result')) + '], check=True)',
+    '    return checkpoint(root, workspace, request)',
     'def crash(candidate, root):',
     "    if os.environ['RELAY_ATOMIC_CRASH'] == 'after':",
     '        original(candidate, root)',
     '    os.kill(os.getpid(), signal.SIGKILL)',
-    'e._workspace_exchange = crash',
+    "if os.environ['RELAY_ATOMIC_CRASH'] == 'writer':",
+    '    e.checkpoint = save_before_ack',
+    'else:',
+    '    e._workspace_exchange = crash',
     'e.main()',
+    '',
+  ].join('\n'));
+  await writeFile(side('writer.py'), [
+    'import errno, os, sys',
+    'from pathlib import Path',
+    'target, result = map(Path, sys.argv[1:])',
+    "draft = ' + unsaved external edit'",
+    "result.with_suffix('.draft').write_text(draft)",
+    'try:',
+    '    fd = os.open(target, os.O_WRONLY | os.O_APPEND | os.O_NONBLOCK)',
+    'except OSError as error:',
+    '    if error.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):',
+    '        raise',
+    "    result.write_text('blocked')",
+    'else:',
+    '    with os.fdopen(fd, "a") as stream:',
+    '        stream.write(draft)',
+    "    result.write_text('wrote')",
     '',
   ].join('\n'));
   await writeFile(registry, JSON.stringify({ roots: workspaces.map((workspace) => workspace.path) }));
@@ -135,8 +165,14 @@ try {
       proposedGit = await gitState(project);
       push = [...args, '--commit', proposedGit[0]];
     }
+    const writer = workspace.name === 'writer';
     const after = workspace.name !== 'before';
-    await run(push, { RELAY_ATOMIC_CRASH: after ? 'after' : 'before' }, 1);
+    const interrupted = await run(push, { RELAY_ATOMIC_CRASH: writer ? 'writer' : after ? 'after' : 'before' }, 1);
+    if (writer) {
+      assert.match(interrupted.message, /writer_conflict/);
+      assert.equal(await readFile(side('writer-result'), 'utf8'), 'blocked');
+      assert.equal(await readFile(side('writer-result.draft'), 'utf8'), ' + unsaved external edit');
+    }
 
     const observed = await run([...args, '--inspect']);
     assert.equal(observed.status, after ? 'published' : 'prepared');
@@ -177,6 +213,19 @@ try {
       data: { text: 'must wait for acknowledgment', createdAt: Date.now(), idempotencyKey: 'pending-' + observed.transfer_id },
     });
     assert.equal(blocked.status(), 409);
+    if (writer) {
+      await page.locator('#chats-tab').click();
+      await page.locator('#new-chat').click();
+      await page.locator('#prompt').fill('Try to start while the writer conflict is pending');
+      const conflict = page.waitForResponse((response) => response.request().method() === 'POST' && /\/sessions$/.test(response.url()));
+      await page.getByRole('button', { name: 'Send message' }).click();
+      assert.equal((await conflict).status(), 409);
+      await page.getByText(/Resume or recover it before continuing|Resume or recover it before starting a task/).waitFor();
+      if (process.env.RELAY_ATOMIC_SCREENSHOTS) {
+        await page.screenshot({ path: path.join(process.env.RELAY_ATOMIC_SCREENSHOTS, 'writer-recovery.png') });
+      }
+      await page.locator('#files-tab').click();
+    }
 
     if (workspace.name === 'rollback') {
       const rollback = await run([...args, '--rollback']);

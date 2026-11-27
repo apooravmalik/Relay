@@ -1103,13 +1103,16 @@ class ImportPreviewTests(unittest.TestCase):
         (self.source / 'node_modules' / 'dependency').write_text('omit')
         (self.source / '.venv').mkdir()
         (self.source / '.venv' / 'package').write_text('omit')
-        db = sqlite3.connect(self.source / 'state.sqlite')
-        self.addCleanup(db.close)
-        db.execute('pragma journal_mode=wal')
-        db.execute('create table example(value text)')
-        db.execute("insert into example values ('kept')")
-        db.commit()
-        result = self.run_relay('--workspace', self.workspace_id, '--into', str(self.dest), '--json')
+        args = ('--workspace', self.workspace_id, '--into', str(self.dest), '--json')
+        with contextlib.closing(sqlite3.connect(self.source / 'state.sqlite')) as db:
+            db.execute('pragma journal_mode=wal')
+            db.execute('create table example(value text)')
+            db.execute("insert into example values ('kept')")
+            db.commit()
+            refused = self.run_relay(*args)
+            self.assertEqual(json.loads(refused.stdout)['error'], 'source_busy')
+            self.assertFalse((self.dest / 'source').exists())
+        result = self.run_relay(*args)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         project = self.dest / 'source'
         self.assertEqual((project / '.env').read_text(), 'TOKEN=private')
@@ -1118,8 +1121,7 @@ class ImportPreviewTests(unittest.TestCase):
         self.assertEqual((project / 'dist' / 'app.js').read_text(), 'built')
         self.assertFalse((project / 'node_modules').exists())
         self.assertFalse((project / '.venv').exists())
-        self.assertTrue((project / 'state.sqlite-wal').exists())
-        with sqlite3.connect(project / 'state.sqlite') as restored:
+        with contextlib.closing(sqlite3.connect(project / 'state.sqlite')) as restored:
             self.assertEqual(restored.execute('select value from example').fetchone()[0], 'kept')
 
     def test_linked_worktree_git_file_is_not_copied(self):

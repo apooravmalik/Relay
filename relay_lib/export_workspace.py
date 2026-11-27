@@ -1,15 +1,18 @@
 """VM-side workspace capture, handoff, and recovery operations."""
 import hashlib
 import sqlite3
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 import fnmatch
+import errno
 import fcntl
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -303,9 +306,31 @@ def make_history_bundle(root, meta, target, policy_root=None):
         shutil.rmtree(scratch)
 
 
+def _capture_roots(root):
+    roots = [root]
+    git = run_git(root, 'rev-parse', '--path-format=absolute', '--show-toplevel',
+                  '--absolute-git-dir', '--git-common-dir', check=False)
+    if git.returncode == 0:
+        top, git_directory, common_directory = (Path(os.fsdecode(line)).resolve() for line in git.stdout.splitlines())
+        if top != root:
+            error('unsupported_git_state', 'Register the Git repository root, not a subdirectory.')
+        if (common_directory / 'objects/info/alternates').exists():
+            error('writer_unverified', 'Cannot fence Git object stores outside this workspace.')
+        for directory in (common_directory, git_directory):
+            if not any(directory == watched or watched in directory.parents for watched in roots):
+                roots.append(directory)
+    return roots
+
+
 def capture(root, workspace_id, include_history=True, against=None):
-    # Compare complete inventories and index before and after copying. Independent
-    # writers must still be paused: scans are not an atomic filesystem snapshot.
+    roots = _capture_roots(root)
+    with WriterFence(*roots) as fence:
+        if _capture_roots(root) != roots:
+            error('writer_unverified', 'The Git storage changed while establishing the writer fence.')
+        return _capture_fenced(root, workspace_id, include_history, against, fence)
+
+
+def _capture_fenced(root, workspace_id, include_history, against, fence):
     export_root = Path.home() / '.relay-v0' / 'exports'
     export_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(export_root, 0o700)
@@ -358,7 +383,9 @@ def capture(root, workspace_id, include_history=True, against=None):
             manifest['delta_from'] = against['transfer_id']
         if meta['mode'] != 'plain':
             retain_git_snapshot(root, manifest, target if against is None else None)
+        fence.check()
         (target / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=True, sort_keys=True, separators=(',', ':')))
+        fence.check()
         return manifest, str(target)
     except BaseException:
         shutil.rmtree(target, ignore_errors=True)
@@ -380,7 +407,9 @@ def checkpoint(root, workspace_id, request):
     with open(folder / (endpoint + '.lock'), 'a') as lock:
         os.chmod(lock.name, 0o600)
         fcntl.flock(lock, fcntl.LOCK_EX)
-        current = json.loads(file.read_text()) if file.exists() else {'checkpoint': None, 'pending': None}
+        previous = json.loads(file.read_text()) if file.exists() else None
+        current = dict(previous) if previous is not None else {'checkpoint': None, 'pending': None}
+        fence = _checkpoint_fences.get(workspace_id)
         action = request.get('action')
         proposed = request.get('checkpoint')
         if action in ('begin_import', 'begin_pull', 'init', 'prepare'):
@@ -418,7 +447,10 @@ def checkpoint(root, workspace_id, request):
             if current['pending'] not in (None, proposed): error('source_busy', 'A different transfer is pending for this destination.')
             current['pending'] = proposed
         elif action == 'commit':
-            if current['checkpoint'] and current['checkpoint']['transfer_id'] == request.get('transfer_id') and current['pending'] is None: return current
+            if current['checkpoint'] and current['checkpoint']['transfer_id'] == request.get('transfer_id') and current['pending'] is None:
+                if fence:
+                    fence.check()
+                return current
             if not current['pending'] or current['pending']['transfer_id'] != request.get('transfer_id'): error('checkpoint_mismatch', 'No matching prepared checkpoint.')
             current['checkpoint'] = current['pending']; current['pending'] = None
         elif action == 'abort':
@@ -430,10 +462,22 @@ def checkpoint(root, workspace_id, request):
             try:
                 with os.fdopen(fd, 'w') as stream:
                     json.dump(current, stream, sort_keys=True); stream.flush(); os.fsync(stream.fileno())
+                if fence:
+                    fence.check()
                 os.replace(temp, file)
-                d = os.open(folder, os.O_RDONLY)
-                try: os.fsync(d)
-                finally: os.close(d)
+                _batch_sync_dir(folder)
+                if fence:
+                    try:
+                        fence.check()
+                    except RuntimeError:
+                        # Checkpoint readers take this same lock. Restore the prior
+                        # state if activity arrived during replacement or fsync.
+                        if previous is None:
+                            file.unlink()
+                            _batch_sync_dir(folder)
+                        else:
+                            _push_write_json(file, previous)
+                        raise
             finally:
                 if os.path.exists(temp): os.unlink(temp)
         return current
@@ -447,6 +491,151 @@ def export_manifest(root, workspace_id, request):
     manifest = json.loads(raw)
     if manifest['workspace_id'] != workspace_id or manifest['source_path'] != str(root): error('checkpoint_mismatch', 'Original export identity differs.')
     return {'manifest': manifest, 'sha256': hashlib.sha256(raw).hexdigest(), 'export_path': str(path.parent)}
+
+
+class WriterFence:
+    """Linux inode leases plus namespace monitoring for a short verification window."""
+
+    # inotify events that indicate a content or namespace change.
+    _MOVE_SELF = 0x800
+    _DIRECTORY = 0x40000000
+    _WATCH = 0x2 | 0x4 | 0x8 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | _MOVE_SELF
+    _EVENT = struct.Struct('iIII')
+
+    def __init__(self, *roots):
+        self.roots = roots
+        self.fds = {}
+        self.watches = set()
+        self.root_watches = set()
+        self.expected_roots = {}
+
+    def __enter__(self):
+        import ctypes
+        self.notify = None
+        self.mask = None
+        if not sys.platform.startswith('linux') or not hasattr(fcntl, 'F_SETLEASE'):
+            error('writer_unverified', 'This VM cannot verify writer quiescence; use a supported Linux filesystem.')
+        try:
+            self.mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGIO})
+            libc = ctypes.CDLL(None, use_errno=True)
+            self.watch = libc.inotify_add_watch
+            self.watch.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32)
+            self.notify = libc.inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
+            if self.notify < 0:
+                self.notify = None
+                error('writer_unverified', 'Could not start the filesystem writer monitor.')
+            for root in self.roots:
+                self._pin(root, root=True)
+            self.check()
+            return self
+        except BaseException:
+            self.__exit__()
+            raise
+
+    def _pin(self, path, *, root=False):
+        import ctypes
+        try:
+            found = path.lstat()
+            if stat.S_ISDIR(found.st_mode):
+                # IN_ONLYDIR and IN_DONT_FOLLOW reject a replaced entry.
+                watch = self.watch(self.notify, os.fsencode(path), self._WATCH | 0x01000000 | 0x02000000)
+                if watch < 0:
+                    raise OSError(ctypes.get_errno(), 'inotify_add_watch')
+                if watch in self.watches:
+                    error('writer_unverified', 'A repeated directory identity cannot be fenced.')
+                identity = found.st_dev, found.st_ino
+                self.watches.add(watch)
+                if root:
+                    self.root_watches.add(watch)
+                    self.expected_roots[path] = tuple(map(str, identity))
+                for child in path.iterdir():
+                    self._pin(child)
+                if tuple(map(int, directory_identity(path))) != identity:
+                    error('writer_unverified', 'A directory changed while establishing the writer fence.')
+            elif root:
+                error('writer_unverified', 'A workspace root is no longer a directory.')
+            elif stat.S_ISREG(found.st_mode):
+                fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+                try:
+                    opened = os.fstat(fd)
+                    identity = found.st_dev, found.st_ino
+                    if identity != (opened.st_dev, opened.st_ino) or not stat.S_ISREG(opened.st_mode):
+                        error('writer_unverified', 'A file changed while establishing the writer fence.')
+                    if identity not in self.fds:
+                        fcntl.fcntl(fd, fcntl.F_SETOWN, os.getpid())
+                        fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_RDLCK)
+                        self.fds[identity] = fd
+                        fd = None
+                finally:
+                    if fd is not None:
+                        os.close(fd)
+            elif not stat.S_ISLNK(found.st_mode):
+                error('writer_unverified', 'A special file cannot be fenced. Stop its service and take an application backup.')
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EBUSY):
+                error('source_busy', 'An external writer still has a workspace file open. Stop it and retry.')
+            error('writer_unverified', 'Could not fence the workspace. Check filesystem support, permissions, and descriptor limits.')
+
+    def check(self, *, exchanged=False):
+        moved = set()
+        try:
+            # A break request makes the fence unusable immediately, even while
+            # the kernel is still preventing the attempted write.
+            if (signal.sigtimedwait({signal.SIGIO}, 0) is not None
+                    or any(fcntl.fcntl(fd, fcntl.F_GETLEASE) != fcntl.F_RDLCK for fd in self.fds.values())):
+                error('writer_conflict', 'External writer activity interrupted the handoff. Stop writers and inspect recovery.')
+            while True:
+                try:
+                    data = os.read(self.notify, 65536)
+                except BlockingIOError:
+                    break
+                if not data:
+                    error('writer_unverified', 'The filesystem writer monitor stopped.')
+                cursor = 0
+                while cursor < len(data):
+                    watch, mask, _, length = self._EVENT.unpack_from(data, cursor)
+                    cursor += self._EVENT.size + length
+                    if (exchanged and watch in self.root_watches and watch not in moved
+                            and mask & ~self._DIRECTORY == self._MOVE_SELF):
+                        moved.add(watch)
+                        continue
+                    error('writer_conflict', 'External workspace changes interrupted the handoff. Stop writers and inspect recovery.')
+            if exchanged:
+                if moved != self.root_watches:
+                    error('writer_unverified', 'The monitor could not verify the directory exchange.')
+                first, second = self.roots
+                self.expected_roots[first], self.expected_roots[second] = self.expected_roots[second], self.expected_roots[first]
+            for path, expected in self.expected_roots.items():
+                if directory_identity(path) != expected:
+                    error('writer_unverified', 'A fenced workspace directory identity changed.')
+            if signal.sigtimedwait({signal.SIGIO}, 0) is not None:
+                error('writer_conflict', 'External writer activity interrupted the handoff. Stop writers and inspect recovery.')
+        except OSError:
+            error('writer_unverified', 'Could not verify writer quiescence. Inspect the handoff before retrying.')
+
+    def __exit__(self, *_):
+        try:
+            for fd in self.fds.values():
+                os.close(fd)
+            if self.notify is not None:
+                os.close(self.notify)
+        finally:
+            if self.mask is not None:
+                while signal.sigtimedwait({signal.SIGIO}, 0) is not None:
+                    pass
+                signal.pthread_sigmask(signal.SIG_SETMASK, self.mask)
+
+
+_checkpoint_fences = {}
+
+
+@contextmanager
+def checkpoint_fence(workspace_id, fence):
+    _checkpoint_fences[workspace_id] = fence
+    try:
+        yield
+    finally:
+        del _checkpoint_fences[workspace_id]
 
 
 def _push_assert_idle(root):
@@ -537,10 +726,11 @@ def push_one(root, workspace_id, request):
             if meta != proposed['git'] or entries != proposed['entries']: error('recovery_required', 'Workspace changed during publication; previous file retained.')
             state['phase'] = 'published'; _push_write_json(state_path, state)
         if state['phase'] in ('published', 'acknowledged'):
-            meta, entries, _ = inspect(root)
-            if meta != proposed['git'] or entries != proposed['entries'] or not candidate.is_file() or sha(candidate) != old[relative]['sha256']:
-                error('recovery_required', 'Workspace or recovery copy changed after publication.')
-            current = checkpoint(root, workspace_id, {'action':'commit', 'endpoint':endpoint, 'transfer_id':transfer})
+            with WriterFence(root, directory) as fence, checkpoint_fence(workspace_id, fence):
+                meta, entries, _ = inspect(root)
+                if meta != proposed['git'] or entries != proposed['entries'] or not _batch_matches(candidate, old[relative]):
+                    error('recovery_required', 'Workspace or recovery copy changed after publication.')
+                current = checkpoint(root, workspace_id, {'action':'commit', 'endpoint':endpoint, 'transfer_id':transfer})
             if current['checkpoint'] != proposed or current['pending'] is not None: error('recovery_required', 'Remote acknowledgment differs.')
             state['phase'] = 'acknowledged'; _push_write_json(state_path, state)
             return {'status':'SUCCESS', 'transfer_id':transfer, 'recovery_path':str(candidate), 'checkpoint':current['checkpoint']}
@@ -980,7 +1170,7 @@ def _check_exchange(root, candidate, record, side):
         error('recovery_required', 'A workspace version changed; both copies are retained.')
 
 
-def _publish_tree(root, directory, state_path, state, base, proposed, build, *, transfer=None):
+def _publish_tree(root, directory, state_path, state, base, proposed, build, *, transfer=None, finish=None):
     candidate = directory / 'previous'
     if state['phase'] in ('rolling_back', 'aborted'):
         error('recovery_required', 'This handoff is rolling back or was aborted. Inspect or finish rollback.')
@@ -1006,22 +1196,31 @@ def _publish_tree(root, directory, state_path, state, base, proposed, build, *, 
 
     record = state['exchange']
     side = _exchange_side(root, candidate, record)
-    _check_exchange(root, candidate, record, side)
-    _authorize_exchange(root, transfer, record)
-    if side == 'original':
-        if state['phase'] != 'prepared':
-            error('recovery_required', 'The publication journal and workspace disagree.')
-        if transfer is not None:
-            _push_assert_idle(root)
-        _workspace_exchange(candidate, root)
-    _batch_sync_dir(root.parent)
-    _batch_sync_dir(directory)
-    if _exchange_side(root, candidate, record) != 'replacement':
-        error('recovery_required', 'Workspace exchange could not be verified.')
-    _check_exchange(root, candidate, record, 'replacement')
-    if state['phase'] != 'acknowledged':
-        state['phase'] = 'published'
-        _push_write_json(state_path, state)
+    if side == 'original' and transfer is not None:
+        _push_assert_idle(root)
+    with (WriterFence(root, candidate) if transfer is not None else nullcontext()) as fence:
+        _check_exchange(root, candidate, record, side)
+        _authorize_exchange(root, transfer, record)
+        if side == 'original':
+            if state['phase'] != 'prepared':
+                error('recovery_required', 'The publication journal and workspace disagree.')
+            if fence is not None:
+                fence.check()
+            _workspace_exchange(candidate, root)
+            if fence is not None:
+                fence.check(exchanged=True)
+        _batch_sync_dir(root.parent)
+        _batch_sync_dir(directory)
+        if _exchange_side(root, candidate, record) != 'replacement':
+            error('recovery_required', 'Workspace exchange could not be verified.')
+        _check_exchange(root, candidate, record, 'replacement')
+        if fence is not None:
+            fence.check()
+        if state['phase'] != 'acknowledged':
+            state['phase'] = 'published'
+            _push_write_json(state_path, state)
+        if finish is not None:
+            return finish(fence)
 
 
 def _build_plain(candidate, directory, ops):
@@ -1074,14 +1273,18 @@ def batch_apply(root, workspace_id, request):
             _push_write_json(state_path, state)
         elif 'exchange' not in state and state['phase'] == 'building':
             verify_incoming(directory, state['operations'])
-        _publish_tree(root, directory, state_path, state, base, proposed,
-                      lambda candidate: _build_plain(candidate, directory, state['operations']), transfer=transfer)
-        current = checkpoint(root, workspace_id, dict(endpoint, action='commit', transfer_id=transfer))
-        if current != {'checkpoint': proposed, 'pending': None}:
-            error('recovery_required', 'Remote acknowledgment differs.')
-        state['phase'] = 'acknowledged'
-        _push_write_json(state_path, state)
-        return {'status': 'SUCCESS', 'transfer_id': transfer, 'recovery_path': str(directory), 'checkpoint': proposed}
+        def acknowledge(fence):
+            with checkpoint_fence(workspace_id, fence):
+                current = checkpoint(root, workspace_id, dict(endpoint, action='commit', transfer_id=transfer))
+            if current != {'checkpoint': proposed, 'pending': None}:
+                error('recovery_required', 'Remote acknowledgment differs.')
+            state['phase'] = 'acknowledged'
+            _push_write_json(state_path, state)
+            return {'status': 'SUCCESS', 'transfer_id': transfer, 'recovery_path': str(directory), 'checkpoint': proposed}
+
+        return _publish_tree(root, directory, state_path, state, base, proposed,
+                             lambda candidate: _build_plain(candidate, directory, state['operations']),
+                             transfer=transfer, finish=acknowledge)
 
 
 def _legacy_batch_apply(root, workspace_id, request):
@@ -1115,18 +1318,19 @@ def _legacy_batch_apply(root, workspace_id, request):
             if meta != proposed['git'] or entries != proposed['entries']: error('recovery_required', 'Published workspace does not match the candidate.')
             state['phase'] = 'published'; _push_write_json(state_path, state)
         if state['phase'] in ('published', 'acknowledged'):
-            meta, entries, _ = inspect(root)
-            if meta != proposed['git'] or entries != proposed['entries']: error('recovery_required', 'Published workspace changed before acknowledgment.')
-            for index, op in enumerate(ops):
-                if op['action'] == 'modify' and not _batch_matches(directory / 'incoming' / op['path'], op['old']):
-                    error('recovery_required', 'Previous file recovery copy is missing or changed.')
-                if op['action'] == 'delete' and not _batch_matches(directory / 'backup' / str(index), op['old']):
-                    error('recovery_required', 'Deleted file recovery copy is missing or changed.')
-                if op['action'] == 'rmdir':
-                    saved = directory / 'backup' / str(index)
-                    if not saved.is_dir() or saved.is_symlink() or any(saved.iterdir()): error('recovery_required', 'Deleted directory recovery copy changed.')
-            current = checkpoint(root, workspace_id, {'action':'commit', 'endpoint':identity['endpoint'], 'transfer_id':identity['transfer_id']})
-            if current['checkpoint'] != proposed or current['pending'] is not None: error('recovery_required', 'Remote acknowledgment differs.')
+            with WriterFence(root, directory) as fence, checkpoint_fence(workspace_id, fence):
+                meta, entries, _ = inspect(root)
+                if meta != proposed['git'] or entries != proposed['entries']: error('recovery_required', 'Published workspace changed before acknowledgment.')
+                for index, op in enumerate(ops):
+                    if op['action'] == 'modify' and not _batch_matches(directory / 'incoming' / op['path'], op['old']):
+                        error('recovery_required', 'Previous file recovery copy is missing or changed.')
+                    if op['action'] == 'delete' and not _batch_matches(directory / 'backup' / str(index), op['old']):
+                        error('recovery_required', 'Deleted file recovery copy is missing or changed.')
+                    if op['action'] == 'rmdir':
+                        saved = directory / 'backup' / str(index)
+                        if not saved.is_dir() or saved.is_symlink() or any(saved.iterdir()): error('recovery_required', 'Deleted directory recovery copy changed.')
+                current = checkpoint(root, workspace_id, {'action':'commit', 'endpoint':identity['endpoint'], 'transfer_id':identity['transfer_id']})
+                if current['checkpoint'] != proposed or current['pending'] is not None: error('recovery_required', 'Remote acknowledgment differs.')
             state['phase'] = 'acknowledged'; _push_write_json(state_path, state)
             return {'status':'SUCCESS', 'transfer_id':identity['transfer_id'], 'recovery_path':str(directory), 'checkpoint':current['checkpoint']}
         error('recovery_required', 'Unknown batch transfer phase.')
@@ -1460,25 +1664,31 @@ def rollback_push(root, workspace_id, request, *, git):
         state = (json.loads(state_path.read_text()) if state_path.exists()
                  else {'base': base, 'proposed': proposed, 'publication_version': 2})
         record = state.get('exchange')
+        roots = [root]
         if record:
-            candidate = directory / 'previous'
             _assert_exchange_paths(root, directory)
-            side = _exchange_side(root, candidate, record)
-            _check_exchange(root, candidate, record, side)
-            _authorize_exchange(root, transfer, record)
-            state['phase'] = 'rolling_back'
-            _push_write_json(state_path, state)
-            if side == 'replacement':
-                _workspace_exchange(candidate, root)
-            _batch_sync_dir(root.parent)
-            _batch_sync_dir(directory)
-            if _exchange_side(root, candidate, record) != 'original':
-                error('recovery_required', 'Workspace rollback could not be verified.')
-            _check_exchange(root, candidate, record, 'original')
-        _verify_tree(root, base)
-        current = checkpoint(root, workspace_id, {'action': 'abort', 'endpoint': endpoint, 'transfer_id': transfer})
-        if current != {'checkpoint': base, 'pending': None}:
-            error('recovery_required', 'The original checkpoint could not be verified.')
+            roots.append(directory / 'previous')
+        with WriterFence(*roots) as fence, checkpoint_fence(workspace_id, fence):
+            if record:
+                candidate = roots[1]
+                side = _exchange_side(root, candidate, record)
+                _check_exchange(root, candidate, record, side)
+                _authorize_exchange(root, transfer, record)
+                state['phase'] = 'rolling_back'
+                _push_write_json(state_path, state)
+                if side == 'replacement':
+                    fence.check()
+                    _workspace_exchange(candidate, root)
+                    fence.check(exchanged=True)
+                _batch_sync_dir(root.parent)
+                _batch_sync_dir(directory)
+                if _exchange_side(root, candidate, record) != 'original':
+                    error('recovery_required', 'Workspace rollback could not be verified.')
+                _check_exchange(root, candidate, record, 'original')
+            _verify_tree(root, base)
+            current = checkpoint(root, workspace_id, {'action': 'abort', 'endpoint': endpoint, 'transfer_id': transfer})
+            if current != {'checkpoint': base, 'pending': None}:
+                error('recovery_required', 'The original checkpoint could not be verified.')
         state['phase'] = 'aborted'
         _push_write_json(state_path, state)
         return {'status': 'ABORTED', 'transfer_id': transfer, 'recovery_path': str(directory)}
@@ -1519,24 +1729,32 @@ def git_handoff_remote(root, workspace_id, action, request):
                 checkpoint(root, workspace_id, dict(identity, action='prepare', checkpoint=proposed))
                 publish_git(root, directory, receiving, proposed, transfer=transfer)
                 return {'status': 'PUBLISHED', 'recovery_path': str(directory)}
-        check_git_snapshot(root, proposed)
-        if action == 'git_ack_push' and not done:
-            state = json.loads((directory / 'journal.json').read_text())
-            if state.get('publication_version'):
-                if state['phase'] != 'published' or state['proposed'] != proposed:
-                    error('recovery_required', 'Verify the published Git tree before acknowledging it.')
-                candidate = directory / 'previous'
-                record = state['exchange']
-                if _exchange_side(root, candidate, record) != 'replacement':
-                    error('recovery_required', 'The Git workspace exchange could not be verified.')
-                _check_exchange(root, candidate, record, 'replacement')
         if not pushing:
             _push_assert_idle(root)
         if not done:
-            if action == 'git_prepare_pull':
-                checkpoint(root, workspace_id, dict(identity, action='prepare', checkpoint=proposed))
-            else:
-                checkpoint(root, workspace_id, dict(identity, action='commit', transfer_id=transfer))
+            roots = [root]
+            record = None
+            if action == 'git_ack_push':
+                state = json.loads((directory / 'journal.json').read_text())
+                if state.get('publication_version'):
+                    if state['phase'] != 'published' or state['proposed'] != proposed:
+                        error('recovery_required', 'Verify the published Git tree before acknowledging it.')
+                    roots.append(directory / 'previous')
+                    record = state['exchange']
+                else:
+                    roots.append(directory)
+            with WriterFence(*roots) as fence, checkpoint_fence(workspace_id, fence):
+                check_git_snapshot(root, proposed)
+                if record:
+                    if _exchange_side(root, roots[1], record) != 'replacement':
+                        error('recovery_required', 'The Git workspace exchange could not be verified.')
+                    _check_exchange(root, roots[1], record, 'replacement')
+                if action == 'git_prepare_pull':
+                    checkpoint(root, workspace_id, dict(identity, action='prepare', checkpoint=proposed))
+                else:
+                    checkpoint(root, workspace_id, dict(identity, action='commit', transfer_id=transfer))
+        else:
+            check_git_snapshot(root, proposed)
         return {'status': 'SUCCESS', 'checkpoint': proposed, 'recovery_path': str(directory) if pushing else None}
 
 
@@ -1632,6 +1850,12 @@ def dispatch_handoff(root, workspace_id, action, request):
                 result = rollback_push(root, workspace_id, request, git=action == 'git_rollback')
             elif action.startswith('git_'):
                 result = git_handoff_remote(root, workspace_id, action, request)
+            elif action == 'checkpoint' and request['action'] == 'commit':
+                with WriterFence(root) as fence, checkpoint_fence(workspace_id, fence):
+                    current = checkpoint(root, workspace_id, dict(request, action='get'))
+                    if current['pending'] and current['pending']['transfer_id'] == spec.transfer:
+                        _verify_tree(root, current['pending'])
+                    result = checkpoint(root, workspace_id, request)
             elif action == 'checkpoint':
                 result = checkpoint(root, workspace_id, request)
             else:

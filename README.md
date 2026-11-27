@@ -115,7 +115,14 @@ Plain batch pushes and Git handoffs stage a full replacement on the same
 filesystem and exchange it with the original as one directory operation.
 The previous tree is kept under `previous/` in the reported recovery directory.
 The destination needs space for both trees and a filesystem that supports atomic
-directory exchange. Pause external writers before transfer.
+directory exchange. Pause independent editors and services on both copies from
+before capture until acknowledgment. The Linux VM helper also verifies writer
+quiescence while capturing and during the swap and checkpoint acknowledgment.
+If it cannot hold the fence or sees activity, inspect the pending handoff and
+preserve both versions before retrying. File leases can reject write opens on
+fenced files. Directory monitoring detects ordinary namespace edits, which
+still must be paused. For a running database, take a native backup rather
+than transferring its live directory.
 
 For a pending plain batch or Git push, repeat the push command with `--inspect`
 to see the publication state, with `--resume` to finish, or with `--rollback`
