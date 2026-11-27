@@ -227,7 +227,7 @@ class ImportPreviewTests(unittest.TestCase):
         self.assertEqual(pull.returncode, 0, pull.stdout + pull.stderr)
         self.assertEqual((project / 'newdir' / 'phone').read_text(), 'remote')
 
-    def test_multifile_push_recovers_interruption_after_first_exchange(self):
+    def test_multifile_push_recovers_interruption_after_workspace_exchange(self):
         from relay_lib import batch_push, export_workspace
         (self.source / 'one').write_text('old one')
         (self.source / 'two').write_text('old two')
@@ -235,27 +235,79 @@ class ImportPreviewTests(unittest.TestCase):
         project = self.dest / 'source'
         (project / 'one').write_text('new one'); (project / 'two').write_text('new two')
         original_remote = import_workspace.remote
-        original_exchange = export_workspace._batch_exchange
+        original_exchange = export_workspace._workspace_exchange
         def crash_after_exchange(a, b):
             original_exchange(a, b)
             raise OSError('simulated crash after exchange')
         def inject(ssh, host, workspace, action, request=None):
             if action == 'batch_apply':
-                with patch.object(export_workspace, '_batch_exchange', side_effect=crash_after_exchange):
+                with patch.object(export_workspace, '_workspace_exchange', side_effect=crash_after_exchange):
                     return export_workspace.batch_apply(self.source, workspace, request)
             return original_remote(ssh, host, workspace, action, request)
         with patch.dict(os.environ, self.env, clear=True), patch.object(import_workspace, 'remote', side_effect=inject), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             failed = batch_push.main(['--workspace', self.workspace_id, '--project', str(project), '--json'])
         self.assertEqual(failed, 1)
         self.assertEqual((self.source / 'one').read_text(), 'new one')
-        self.assertEqual((self.source / 'two').read_text(), 'old two')
+        self.assertEqual((self.source / 'two').read_text(), 'new two')
         command = [str(RELAY), 'push', '--workspace', self.workspace_id, '--project', str(project), '--json', '--resume']
         resumed = subprocess.run(command, env=self.env, capture_output=True, text=True)
         self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
         recovery = Path(json.loads(resumed.stdout)['remote_recovery_path'])
-        self.assertEqual((recovery / 'incoming' / 'one').read_text(), 'old one')
+        self.assertEqual((recovery / 'previous' / 'one').read_text(), 'old one')
         self.assertEqual((self.source / 'one').read_text(), 'new one')
         self.assertEqual((self.source / 'two').read_text(), 'new two')
+
+    def test_multifile_push_rollback_restores_original_and_keeps_proposal(self):
+        from relay_lib import batch_push, export_workspace
+
+        self.enable_managed_handoffs()
+        (self.source / 'one').write_text('old one')
+        (self.source / 'two').write_text('old two')
+        dependency = self.source / 'node_modules' / 'runtime'
+        dependency.parent.mkdir()
+        dependency.write_text('VM runtime')
+        imported = self.run_relay('--workspace', self.workspace_id, '--into', str(self.dest), '--json')
+        self.assertEqual(imported.returncode, 0, imported.stdout + imported.stderr)
+        original_checkpoint = json.loads(imported.stdout)['transfer_id']
+        project = self.dest / 'source'
+        (project / 'one').write_text('new one')
+        (project / 'two').unlink()
+        original_remote = import_workspace.remote
+        original_exchange = export_workspace._workspace_exchange
+
+        def fail_after_exchange(a, b):
+            original_exchange(a, b)
+            raise OSError('lost helper after workspace exchange')
+
+        def inject(ssh, host, workspace, action, request=None):
+            if action == 'batch_apply':
+                with patch.object(export_workspace, '_workspace_exchange', side_effect=fail_after_exchange):
+                    return export_workspace.dispatch_handoff(self.source, workspace, action, request)
+            return original_remote(ssh, host, workspace, action, request)
+
+        args = ['--workspace', self.workspace_id, '--project', str(project), '--json']
+        with patch.dict(os.environ, self.env, clear=True), patch.object(import_workspace, 'remote', side_effect=inject), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(batch_push.main(args), 1)
+        self.assertEqual((self.source / 'one').read_text(), 'new one')
+        self.assertFalse((self.source / 'two').exists())
+        self.assertEqual(dependency.read_text(), 'VM runtime')
+        inspect = subprocess.run([str(RELAY), 'push', *args, '--inspect'], env=self.env, capture_output=True, text=True)
+        self.assertEqual(inspect.returncode, 0, inspect.stdout + inspect.stderr)
+        self.assertTrue(json.loads(inspect.stdout)['rollback_available'])
+        self.assertEqual(json.loads(inspect.stdout)['status'], 'published')
+        result = subprocess.run([str(RELAY), 'push', *args, '--rollback'], env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        previous = Path(json.loads(result.stdout)['recovery_path']) / 'previous'
+        self.assertEqual((previous / 'one').read_text(), 'new one')
+        self.assertFalse((previous / 'two').exists())
+        self.assertEqual((self.source / 'one').read_text(), 'old one')
+        self.assertEqual((self.source / 'two').read_text(), 'old two')
+        self.assertEqual(dependency.read_text(), 'VM runtime')
+        with patch.dict(os.environ, self.env, clear=True):
+            pair = json.loads(update_workspace.pairing_path(project).read_text())
+            checkpoint = update_workspace.remote_cp(import_workspace, 'relay-v0', pair, 'get')
+        self.assertEqual(checkpoint['checkpoint']['transfer_id'], original_checkpoint)
+        self.assertIsNone(checkpoint['pending'])
 
     def test_multifile_push_refuses_deleting_directory_with_excluded_vm_data(self):
         (self.source / 'folder').mkdir(); (self.source / 'folder' / 'file').write_text('old')
@@ -281,12 +333,12 @@ class ImportPreviewTests(unittest.TestCase):
                 project = dest / 'source'
                 if kind == 'add': (project / 'added').write_text('new')
                 else: (project / 'existing').unlink()
-                original_remote = import_workspace.remote; original_rename = export_workspace._batch_noreplace
+                original_remote = import_workspace.remote; original_rename = export_workspace._workspace_exchange
                 def crash_after_rename(a, b):
                     original_rename(a, b); raise OSError('crash after rename')
                 def inject(ssh, host, workspace_id, action, request=None):
                     if action == 'batch_apply':
-                        with patch.object(export_workspace, '_batch_noreplace', side_effect=crash_after_rename):
+                        with patch.object(export_workspace, '_workspace_exchange', side_effect=crash_after_rename):
                             return export_workspace.batch_apply(source, workspace_id, request)
                     return original_remote(ssh, host, workspace_id, action, request)
                 with patch.dict(os.environ, env, clear=True), patch.object(import_workspace, 'remote', side_effect=inject), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -298,7 +350,7 @@ class ImportPreviewTests(unittest.TestCase):
                 else:
                     self.assertFalse((source / 'existing').exists())
                     recovery = Path(json.loads(resumed.stdout)['remote_recovery_path'])
-                    self.assertEqual((recovery / 'backup' / '0').read_text(), 'old')
+                    self.assertEqual((recovery / 'previous' / 'existing').read_text(), 'old')
 
     def test_multifile_push_recovers_lost_final_acknowledgment(self):
         from relay_lib import batch_push
@@ -647,6 +699,58 @@ class ImportPreviewTests(unittest.TestCase):
         self.assertEqual((project / 'file').read_text(), 'working')
         self.assertEqual(subprocess.check_output(['git', '-C', str(project), 'ls-files', '--stage']), before_index)
         self.assertEqual((self.source / 'file').read_text(), 'initial')
+
+    def test_git_workspace_exchange_keeps_original_head_and_index_after_interruption(self):
+        from relay_lib import batch_push, export_workspace
+
+        self.enable_managed_handoffs()
+        def git(root, *args):
+            return subprocess.check_output(['git', '-C', str(root), *args]).strip()
+        def head_and_index(root):
+            return git(root, 'rev-parse', 'HEAD'), git(root, 'ls-files', '--stage')
+
+        git(self.source, 'init', '-q')
+        (self.source / 'one').write_text('old one')
+        (self.source / 'two').write_text('old two')
+        git(self.source, 'add', '.')
+        git(self.source, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'base')
+        expected_original = head_and_index(self.source)
+        imported = self.run_relay('--workspace', self.workspace_id, '--into', str(self.dest), '--json')
+        self.assertEqual(imported.returncode, 0, imported.stdout + imported.stderr)
+        desktop = self.dest / 'source'
+        (desktop / 'one').write_text('committed one')
+        git(desktop, 'add', 'one')
+        git(desktop, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'next')
+        (desktop / 'two').write_text('staged two')
+        git(desktop, 'add', 'two')
+        (desktop / 'two').write_text('working two')
+        proposed = head_and_index(desktop)
+        original_remote = import_workspace.remote
+        exchange = export_workspace._workspace_exchange
+
+        def fail_after_exchange(candidate, root):
+            exchange(candidate, root)
+            raise OSError('helper stopped after Git workspace exchange')
+
+        def inject(ssh, host, workspace, action, request=None):
+            if action == 'git_apply':
+                with patch.object(export_workspace, '_workspace_exchange', side_effect=fail_after_exchange):
+                    return export_workspace.dispatch_handoff(self.source, workspace, action, request)
+            return original_remote(ssh, host, workspace, action, request)
+
+        args = ['--workspace', self.workspace_id, '--project', str(desktop), '--json']
+        with patch.dict(os.environ, self.env, clear=True), patch.object(import_workspace, 'remote', side_effect=inject), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(batch_push.main(args + ['--commit', proposed[0].decode()]), 1)
+        self.assertEqual(head_and_index(self.source), proposed)
+        self.assertEqual((self.source / 'two').read_text(), 'working two')
+        result = subprocess.run([str(RELAY), 'push', *args, '--resume'], env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        retained = Path(json.loads(result.stdout)['remote_recovery_path']) / 'previous'
+        self.assertEqual(head_and_index(retained), expected_original)
+        self.assertEqual((retained / 'one').read_text(), 'old one')
+        self.assertEqual((retained / 'two').read_text(), 'old two')
+        (self.source / 'one').write_text('later edit')
+        self.assertEqual((retained / 'one').read_text(), 'old one')
 
     def test_git_round_trips_policy_and_existing_commit(self):
         self.enable_managed_handoffs()

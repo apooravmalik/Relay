@@ -177,7 +177,7 @@ try {
   const ack = await helper(child, 'batch_apply', request);
   assert.deepEqual(ack.result.checkpoint, proposed, JSON.stringify(ack.result));
   assert.equal(await readFile(file, 'utf8'), content);
-  assert.equal(await readFile(path.join(resumed.result.upload_path, 'file'), 'utf8'), 'original');
+  assert.equal(await readFile(path.join(ack.result.recovery_path, 'previous', 'file'), 'utf8'), 'original');
 
   assert.equal((await send(parentPage, 'parent task after acknowledgment')).status(), 202);
   await working(parentPage);

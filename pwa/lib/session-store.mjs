@@ -61,7 +61,7 @@ export class SessionStore {
       if (!existed) this.db.exec('PRAGMA auto_vacuum=INCREMENTAL');
       this.db.exec('PRAGMA busy_timeout=2000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA journal_size_limit=8388608; PRAGMA wal_autocheckpoint=256;');
       const version = this.db.prepare('PRAGMA user_version').get().user_version;
-      if (![0, 1, 2].includes(version)) throw new SessionError('Unsupported session schema. Do not downgrade the controller.', 503);
+      if (![0, 1, 2, 3].includes(version)) throw new SessionError('Unsupported session schema. Do not downgrade the controller.', 503);
       if (version === 0 && existed) throw new SessionError('Uninitialized or damaged session database. Recovery is required.', 503);
       if (version === 0) { this.db.exec(`BEGIN IMMEDIATE;
         CREATE TABLE sessions (
@@ -91,6 +91,10 @@ export class SessionStore {
           state TEXT NOT NULL CHECK (state IN ('ACTIVE','COMPLETED','ABORTED')));
         CREATE INDEX active_handoff_guards ON handoff_guards(state);
         PRAGMA user_version=2;`));
+      if (version < 3) this.transaction(() => this.db.exec(`
+        ALTER TABLE handoff_guards ADD COLUMN replacement_device TEXT;
+        ALTER TABLE handoff_guards ADD COLUMN replacement_inode TEXT;
+        PRAGMA user_version=3;`));
       if (this.db.prepare('PRAGMA quick_check').get().quick_check !== 'ok') throw new SessionError('Session storage integrity check failed.', 503);
       if (this.db.prepare('PRAGMA foreign_key_check').get()) throw new SessionError('Session storage references are inconsistent.', 503);
       if (this.db.prepare(`SELECT s.id FROM sessions s LEFT JOIN workspace_guards g ON g.session_id=s.id
@@ -151,7 +155,9 @@ export class SessionStore {
     const handoffs = this.db.prepare("SELECT * FROM handoff_guards WHERE state='ACTIVE'").all();
     for (const handoff of handoffs) {
       const [device, inode] = directoryIdentity(handoff.workspace_path);
-      if (device !== handoff.device || inode !== handoff.inode) throw new SessionError('A pending handoff workspace identity changed. Recover the handoff before continuing.');
+      const original = device === handoff.device && inode === handoff.inode;
+      const replacement = device === handoff.replacement_device && inode === handoff.replacement_inode;
+      if (!original && !replacement) throw new SessionError('A pending handoff workspace identity changed. Recover the handoff before continuing.');
       if (handoff.workspace_id === workspace.id || overlaps(handoff.workspace_path, workspace.path) || sharesDirectory(handoff.workspace_path, workspace.path)) throw new SessionError('Workspace or overlapping workspace has a pending handoff. Resume or recover it before continuing.');
     }
   }
