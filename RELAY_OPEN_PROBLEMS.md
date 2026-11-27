@@ -156,15 +156,20 @@ Release and platform verification remain tracked under RLY-020 and RLY-023.
 
 ### RLY-016 · External writers cannot be reliably locked out
 
-**Status:** Open — writers must be paused
+**Status:** Linux VM writer fence implemented; deployment validation pending
 
-Relay locks coordinate Relay transfers. The VM open-file check is advisory and
-cannot prevent an editor, database, or a process holding an old file descriptor
-from writing during or after verification.
+A writer that opened a file after the last idle scan could save into the retained
+tree during acknowledgment. Relay would report success while the edit was absent
+from the live tree. The VM helper now requires Linux file leases and monitors
+directory changes while capturing and during the atomic swap and acknowledgment.
+When activity invalidates the fence, it retains both copies and refuses to
+acknowledge. Git pushes check both trees again when acknowledgment is separate.
 
-**Remaining work:** establish and test a practical writer-quiescence protocol;
-continue to detect divergence, preserve recovery copies, and refuse when safety
-cannot be established. Do not claim checksums alone prevent concurrent writes.
+Pause unmanaged editors and services through the transfer. The guard requires
+a compatible Linux filesystem and sufficient descriptors. Namespace monitoring
+and file leases are not a security boundary against privileged processes, and
+native desktop writers are outside the VM fence. Database backup consistency
+remains tracked in RLY-021.
 
 ### RLY-017 · Repeat pull transfers the entire captured workspace
 
