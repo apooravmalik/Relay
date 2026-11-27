@@ -19,6 +19,7 @@ Usage:
   relay pull --abort-update DESTINATION [--vm NAME] [--json]
   relay pull --resume-update DESTINATION [--vm NAME] [--json]
   relay pull --resume TRANSFER_ID [--vm NAME] [--json]
+  relay pull --abort-import TRANSFER_ID [--vm NAME] [--json]
 
 Without --apply, pull writes the remote delta as a patch. The delta includes
 non-ignored untracked files. --apply checks that the local Git base is
@@ -122,6 +123,16 @@ command_doctor() {
   ssh_vm "$vm" 'printf "%s " "$(hostname)"; git --version; tmux -V; printf "vm python: "; if command -v python3 >/dev/null 2>&1; then python3 --version; else printf "missing\n"; fi; printf "vm rsync: "; if command -v rsync >/dev/null 2>&1; then rsync --version | head -1; else printf "missing\n"; fi'
 }
 
+require_standalone_handoff() {
+  local vm=$1
+  if [[ -n "${RELAY_REMOTE_HELPER:-}${RELAY_REMOTE_CONTROLLER_STATE_DIR:-}" ]]; then
+    die "legacy --project handoff is unavailable with a managed controller; use --workspace"
+  fi
+  if ! ssh_vm "$vm" 'test ! -e "$HOME/.relay-v0/controller/sessions-required" && test ! -x "$HOME/.relay-v0/bin/relay-handoff"'; then
+    die "legacy --project handoff requires an unmanaged VM; check connectivity or use --workspace"
+  fi
+}
+
 command_push() {
   local arg
   for arg in "$@"; do
@@ -145,6 +156,7 @@ command_push() {
   require ssh
   require scp
   require tar
+  require_standalone_handoff "$vm"
   project=$(project_path "$project")
 
   local base name temp archive remote_incoming remote_workspace
@@ -243,7 +255,7 @@ command_pull() {
   local arg
   for arg in "$@"; do
     case $arg in
-      --workspace|--workspace=*|--update|--inspect-update|--inspect-update=*|--abort-update|--abort-update=*|--resume-update|--resume-update=*|--resume|--resume=*|--into|--into=*|--name|--name=*|--dry-run|--json)
+      --workspace|--workspace=*|--update|--inspect-update|--inspect-update=*|--abort-update|--abort-update=*|--abort-import|--abort-import=*|--resume-update|--resume-update=*|--resume|--resume=*|--into|--into=*|--name|--name=*|--dry-run|--json)
         require python3
         python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/relay_lib/import_workspace.py" "$@"
         return ;;
@@ -259,6 +271,7 @@ command_pull() {
     esac
   done
   [[ -n "$project" ]] || die "pull requires --project DIR"
+  require_standalone_handoff "$vm"
   project=$(project_path "$project")
   local workspace remote_base local_base patch
   workspace=".relay-v0/workspaces/$(workspace_name "$project")"

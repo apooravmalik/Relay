@@ -60,14 +60,22 @@ candidate refuses a nested task and the configured SSH helper refuses an import
 of the workspace and its nested child
 while it writes, requests Stop, closes and reopens the browser, and imports after
 confirmed termination. This does not test the simultaneous-start race. Set the same variables above, replace
-`RELAY_E2E_WORKSPACE_ID` with `RELAY_E2E_ROOT_ID` and set `RELAY_E2E_VM` plus the
-three `RELAY_REMOTE_*` paths documented in the deployment guide. It leaves the
+`RELAY_E2E_WORKSPACE_ID` with `RELAY_E2E_ROOT_ID` and set `RELAY_E2E_VM` plus
+`RELAY_REMOTE_HELPER` as documented in the deployment guide. It leaves the
 remote workspace and local imported fixture for inspection. Its failure cleanup
 requests Stop but cannot guarantee termination; inspect the printed session.
-Set `RELAY_E2E_GIT=1` to initialize a disposable Git repository and verify its
-commit and index after import. The `session-live-handoff-race.mjs` test holds
+Set `RELAY_E2E_GIT=1` and `RELAY_E2E_REMOTE_WORKSPACE_ROOT` to initialize a
+disposable Git repository and verify its commit and index after import. The
+`session-live-handoff-race.mjs` test holds
 the remote shared gate and verifies the candidate refuses a PWA task start; it
-requires the same URL, root ID, VM, controller path, and disposable flag.
+requires the same URL, root ID, VM and disposable flag, plus the controller
+path in `RELAY_E2E_REMOTE_CONTROLLER_STATE_DIR`.
+
+For a local RLY-025 browser test, run `node pwa/test/session-browser-handoff.mjs`
+with `RELAY_PLAYWRIGHT_MODULE` set to Playwright's `index.mjs`. The fixture uses
+the installed handoff helper and the real PWA server with an injected task
+runner and isolated SQLite storage. It verifies overlapping starts, sibling
+independence, path replacement, and recovery after the handoff process is killed.
 
 For a local browser/controller crash fixture, run:
 

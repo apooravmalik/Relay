@@ -42,20 +42,23 @@ def installation_id(write_json):
     return json.loads(path.read_text())['id']
 
 
-def pair_import(state, write_json):
+def initial_pair(state, write_json):
     manifest = state['manifest']
-    dest = Path(state['destination'])
-    path = pairing_path(dest)
-    if path.exists():
-        current = json.loads(path.read_text())
-        if current.get('checkpoint_id') == manifest['transfer_id']: return
-        raise ValueError('A different pairing already exists for this destination; recovery required.')
     version = 1 if manifest['git']['mode'] == 'plain' else 2
-    write_json(path, {'schema_version': version, 'checkpoint_schema': version, 'installation_id': installation_id(write_json),
-        'workspace_id': manifest['workspace_id'], 'vm': state['vm'], 'destination': str(dest),
+    return {'schema_version': version, 'checkpoint_schema': version, 'installation_id': installation_id(write_json),
+        'workspace_id': manifest['workspace_id'], 'vm': state['vm'], 'destination': state['destination'],
         'source_path': manifest['source_path'], 'checkpoint_id': manifest['transfer_id'],
         'parent_id': None, 'acknowledgment': 'pending', 'git': manifest['git'], 'entries': manifest['entries'],
-        'exclusions': manifest['exclusions'], 'policy': 'existing-import-inclusion-v1'})
+        'exclusions': manifest['exclusions'], 'policy': 'existing-import-inclusion-v1'}
+
+
+def pair_import(state, write_json):
+    path = pairing_path(Path(state['destination']))
+    if path.exists():
+        current = json.loads(path.read_text())
+        if current.get('checkpoint_id') == state['manifest']['transfer_id']: return
+        raise ValueError('A different pairing already exists for this destination; recovery required.')
+    write_json(path, initial_pair(state, write_json))
 
 
 def swap(a, b):
@@ -260,6 +263,7 @@ def finish(op, pending, importer, as_json):
                 raise ValueError('RECOVERY_REQUIRED: publication state differs; preserve both directories and inspect ' + str(staging))
     else:
         ssh, host = importer.ssh_command(op['vm'])
+        remote_cp(importer, op['vm'], base, 'begin_pull', cp(base, manifest))
         payload = staging / 'payload'; payload.mkdir(exist_ok=True)
         import shlex, subprocess
         source = host + ':' + shlex.quote(op['export_path'].rstrip('/') + '/')

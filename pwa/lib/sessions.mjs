@@ -1,9 +1,9 @@
 import { EventEmitter } from 'node:events';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { realpath } from 'node:fs/promises';
-import { SessionError, SessionStore, terminalStates } from './session-store.mjs';
+import { directoryIdentity, SessionError, SessionStore, terminalStates } from './session-store.mjs';
 import { acquireLock, bootId, ExecutionScopes } from './execution-scope.mjs';
+import { assertTransferIdle } from './transfer-readiness.mjs';
 
 export class SessionManager extends EventEmitter {
   constructor({ stateDirectory = process.env.RELAY_CONTROLLER_STATE_DIR || path.join(homedir(), '.relay-v0/controller'), scopes = new ExecutionScopes(), run, interrupt, openPreview, stopPreview, checkPreview = async () => {}, validateThread = async () => {}, validateInput = async () => {}, now, storeOptions } = {}) {
@@ -36,6 +36,16 @@ export class SessionManager extends EventEmitter {
     } catch (error) { this.store?.close(); await this.singleton.release(); throw error; }
   }
   async ensure() { await this.ready.catch(() => { throw new SessionError('Session storage initialization failed. Restore storage before execution.', 503); }); if (this.fatal || !this.singleton.alive()) throw new SessionError('Session storage or controller ownership needs recovery.', 503); }
+  async saveAttachment(workspace, save) {
+    await this.ensure();
+    const gate = await acquireLock(path.join(this.directory, 'handoff-locks'), 'workspace-hierarchy', { waitSeconds: 1 });
+    try {
+      await assertTransferIdle(workspace.id, workspace.path);
+      this.store.assertWorkspaceIdle(workspace, directoryIdentity(workspace.path));
+      if (this.draining || !gate.alive()) throw new SessionError('Workspace coordination is unavailable. Retry the attachment.', 503);
+      return await save();
+    } finally { await gate.release(); }
+  }
   async start(owner, workspace, body) {
     await this.ensure();
     const { digest } = SessionStore.request(body);
@@ -54,7 +64,7 @@ export class SessionManager extends EventEmitter {
     const { input, digest } = SessionStore.request(body);
     const existing = this.store.prior(owner, workspace.id, body.idempotencyKey, digest);
     if (existing) return existing;
-    if (await realpath(workspace.path) !== workspace.path) throw new SessionError('Workspace identity changed.', 409);
+    const workspaceIdentity = directoryIdentity(workspace.path);
     if (input.threadId) await this.validateThread(workspace.path, input.threadId);
     await this.validateInput(input);
     await this.scopes.available();
@@ -67,11 +77,12 @@ export class SessionManager extends EventEmitter {
     try {
       lock = await acquireLock(lockDirectory, workspace.id);
       // A pending transfer journal/checkpoint must be settled before another writer starts.
-      const { assertTransferIdle } = await import('./transfer-readiness.mjs');
       await assertTransferIdle(workspace.id, workspace.path);
       if (this.draining) throw new SessionError('Controller is draining. No new task was started.', 503);
       if (!gate.alive()) throw new SessionError('Workspace coordination lock was lost.');
-      reservation = this.store.reserve({ owner, workspace, key: body.idempotencyKey, input, digest, bootId: this.boot });
+      const currentIdentity = directoryIdentity(workspace.path);
+      if (currentIdentity.some((value, index) => value !== workspaceIdentity[index])) throw new SessionError('Workspace identity changed.');
+      reservation = this.store.reserve({ owner, workspace, key: body.idempotencyKey, input, digest, bootId: this.boot, workspaceIdentity });
       if (!reservation.created) { await lock.release(); return reservation.session; }
     } catch (error) { await lock?.release(); throw error; }
     finally { await gate.release(); }

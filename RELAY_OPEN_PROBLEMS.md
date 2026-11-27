@@ -1,6 +1,6 @@
 # Relay — Open Problems and Validation Backlog
 
-**Last reviewed:** 25 November 2026 (older entries retain their historical status except where updated below)
+**Last reviewed:** 27 November 2026 (older entries retain their historical status except where updated below)
 
 This is the working list of problems found while testing the Mac → VM → phone
 workflow. A problem is closed only after it has reproducible test evidence; a
@@ -16,35 +16,6 @@ design idea alone is not a fix.
   implementation claim.
 
 ## P0 — Sync correctness and safety
-
-### RLY-025 · Overlapping workspace paths do not share execution guards
-
-**Status:** Partially mitigated in candidate — handoff overlap remains unsafe
-
-Workspace identity is derived from its exact path. The PWA can list a configured
-root and also register a directory beneath it, but session reservations and
-handoff locks are keyed by workspace ID. An active task in the parent and a task
-or transfer in the child can therefore address the same files under different
-guards. The durable guard query also checks the exact ID, not overlapping paths.
-An isolated store accepted simultaneous reservations for `/tmp/example` and
-`/tmp/example/child`; no live workspace was modified in that reproduction.
-The session store rejects overlapping active or uncertain task reservations while
-allowing siblings; a real nested task and SSH import were refused while the parent
-task was writing. The candidate PWA and updated local SSH helper also use a shared
-reservation gate and inspect pending checkpoints across overlapping paths. A
-Playwright test failed against the old candidate (task incorrectly accepted while
-the SSH gate was held) and passed after the candidate update. Cross-language and
-pending-state fixtures also pass. Crash during lock acquisition, legacy helpers,
-path identity, and broader recovery remain release blockers; do not close this item.
-
-**Required fix:** coordinate canonical ancestor/descendant paths across session
-reservation, capture, push, pull, checkpoint mutation, recovery, and controller
-downtime without serializing unrelated sibling workspaces unnecessarily. Cover
-concurrent starts, transfer races, symlink/path identity, crashes, old desktop
-helpers, and terminal/uncertain states with cross-process tests. Until verified,
-do not use overlapping workspaces concurrently or hand off either while a task
-in the other is active. The isolated test service currently lists its parent test
-root and registered child fixtures, so this limitation applies there too.
 
 ### RLY-001 · There is no phone-requested Mac → VM sync
 
@@ -331,6 +302,10 @@ tests include:
   active task and the state after confirmed Stop.
 - Paired desktop Git and plain repeat handoffs and merge recovery with the
   candidate's matching controller state and helper.
+- Deploy the shared SQLite workspace reservations from RLY-025 and verify them
+  with the installed helper over real SSH and a real Codex task. Repeat the
+  parent/child race, directory identity check, and transfer crash/retry cases,
+  including a mismatched or incompatible helper.
 - Dedicated-controller crash, orphaned or detached writer, uncertainty, audited
   recovery, stale identity, and storage-failure cases with actual cgroups and
   real Codex. A mocked process driver is not production containment evidence.
@@ -490,21 +465,19 @@ resource quotas, and immediate revocation.
 
 ## Verification queue
 
-1. Close the overlapping-path start/transfer race (RLY-025) before claiming
-   workspace guard safety; retain conservative recovery when evidence is missing.
-2. Finish V1.4 acceptance (RLY-023): real Codex crash/recovery, paired Git and
+1. Finish V1.4 acceptance (RLY-023): real Codex crash/recovery, paired Git and
    plain handoffs under the candidate guard, preview cleanup, and physical-phone
    offline/reconnect and Stop checks. Monitor the cleanup fixture fix (RLY-026)
    and verify remaining UI/phone timing (RLY-022).
-3. Exercise crash and retry boundaries, disk-full behavior and external-writer
+2. Exercise crash and retry boundaries, disk-full behavior and external-writer
    coordination on a separate disposable VM and native macOS/Linux (RLY-003,
    RLY-004, RLY-012, RLY-014–016, RLY-019–020).
-4. Design incremental repeat pull and secure artifact retention (RLY-017–018),
+3. Design incremental repeat pull and secure artifact retention (RLY-017–018),
    and validate application-consistent database backup/restore (RLY-021).
-5. Address product work separately: controlled phone sync/terminal, durable
+4. Address product work separately: controlled phone sync/terminal, durable
    ownership, model compatibility, environment handoff and CLI packaging
    (RLY-001–002, RLY-006–009, RLY-013). Validate preview readiness (RLY-005).
-6. Keep multi-user onboarding and Firecracker isolation gated until their
+5. Keep multi-user onboarding and Firecracker isolation gated until their
    dedicated architecture and security validation are complete (RLY-010–011).
 
 ## Closed / do not re-open without a new reproduction
@@ -515,3 +488,24 @@ resource quotas, and immediate revocation.
   not the normal access path.
 - A persistent tmux/Codex workflow on the VM survives ordinary phone
   disconnection and VM reboot.
+
+### RLY-025 · Share execution guards across overlapping workspace paths
+
+**Status:** Done — implemented and verified locally on 27 November 2026
+
+An active task in a parent workspace and an operation in its registered child
+could address the same files through different guards. The PWA and installed VM
+helper now check the same SQLite store for overlapping workspace paths. Managed
+transfer reservations persist across SSH commands, and a completed retry can
+acknowledge the recorded checkpoint without publishing again.
+
+[Local Playwright coverage](pwa/test/session-browser-handoff.mjs) used the
+PWA and a real helper with disposable workspaces and a simulated task. It
+verified simultaneous starts, unrelated siblings, changed directory identity,
+attachment refusal, and recovery when the helper was killed during upload or
+after checkpoint commit. The Node suite passed 68 tests and the Python suite
+passed 83; three opt-in VM tests were skipped.
+
+Candidate rollout and end-to-end validation over real SSH and Codex are tracked
+under RLY-023. Direct SSH commands and external editors are outside the managed
+reservation protocol.

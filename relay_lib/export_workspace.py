@@ -1,4 +1,4 @@
-"""Remote, read-only workspace capture helper, executed by the local CLI over SSH."""
+"""VM-side workspace capture, handoff, and recovery operations."""
 import hashlib
 import sqlite3
 from contextlib import closing, contextmanager
@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import NamedTuple, Optional
 import uuid
 
 
@@ -382,12 +383,30 @@ def checkpoint(root, workspace_id, request):
         current = json.loads(file.read_text()) if file.exists() else {'checkpoint': None, 'pending': None}
         action = request.get('action')
         proposed = request.get('checkpoint')
-        if action in ('init', 'prepare'):
+        if action in ('begin_import', 'begin_pull', 'init', 'prepare'):
             if not isinstance(proposed, dict) or proposed.get('workspace_id') != workspace_id or proposed.get('endpoint') != endpoint or proposed.get('source_path') != str(root): error('invalid_request', 'Checkpoint identity mismatch.')
             transfer = proposed.get('transfer_id', '')
             if not re.fullmatch(r'[0-9a-f]{32}', transfer): error('invalid_request', 'Invalid transfer ID.')
             saved = json.loads((Path.home() / '.relay-v0' / 'exports' / transfer / 'manifest.json').read_text())
             if saved['workspace_id'] != workspace_id or saved['source_path'] != str(root) or saved['entries'] != proposed.get('entries') or saved['git'] != proposed.get('git'): error('checkpoint_mismatch', 'Checkpoint does not match the captured export.')
+        if action in ('begin_import', 'begin_pull'):
+            if current == {'checkpoint': proposed, 'pending': None}:
+                return current
+            if action == 'begin_import':
+                valid_base = current == {'checkpoint': None, 'pending': None} and proposed.get('generation') == 0 and proposed.get('parent_id') is None
+            else:
+                base = current['checkpoint']
+                valid_base = base and proposed.get('parent_id') == base['transfer_id'] and proposed.get('generation') == base['generation'] + 1 and current['pending'] in (None, proposed)
+            if not valid_base:
+                error('checkpoint_mismatch', 'Handoff checkpoint differs.')
+            meta, entries, _ = inspect(root)
+            if meta != proposed['git'] or entries != proposed['entries']:
+                error('source_changed', 'Workspace changed after capture. Inspect or start a fresh transfer.')
+            return current
+        if action == 'abort_import':
+            if current != {'checkpoint': None, 'pending': None}:
+                error('recovery_required', 'An initial checkpoint exists. Resume instead of aborting.')
+            return current
         if action == 'init':
             if current['checkpoint'] is None and current['pending'] is None:
                 if proposed.get('generation') != 0 or proposed.get('parent_id') is not None: error('checkpoint_mismatch', 'Invalid initial generation.')
@@ -583,40 +602,117 @@ def _batch_directory(transfer):
 _turn_locks = {}
 
 
-def assert_session_idle(workspace_id, workspace_root=None):
-    controller = Path(os.environ.get('RELAY_CONTROLLER_STATE_DIR', Path.home() / '.relay-v0/controller'))
+class HandoffRequest(NamedTuple):
+    transfer: str
+    kind: str
+    endpoint: str
+    digest: str
+    terminal_state: Optional[str]
+
+
+def controller_directory():
+    return Path(os.environ.get('RELAY_CONTROLLER_STATE_DIR', Path.home() / '.relay-v0/controller'))
+
+
+@contextmanager
+def guard_database(write=False):
+    controller = controller_directory()
     directory = controller / 'sessions'
     database, marker = directory / 'sessions.sqlite', directory / 'initialized'
     required = controller / 'sessions-required'
     if not database.exists() and not marker.exists() and not required.exists():
-        return  # Legacy installation, before durable sessions are initialized.
+        if os.environ.get('RELAY_HANDOFF_MANAGED') == '1':
+            error('source_busy', 'Managed controller storage is unavailable. Start or restore the controller before handoff.')
+        yield None  # Standalone transfer installation, with no PWA controller.
+        return
     try:
         if database.is_symlink() or not database.is_file() or marker.read_text() != '1\n':
             raise ValueError('Missing or invalid initialized store.')
-        with closing(sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True, timeout=2)) as connection:
-            if connection.execute('PRAGMA user_version').fetchone()[0] != 1:
+        mode = 'rw' if write else 'ro'
+        with closing(sqlite3.connect(database.resolve().as_uri() + '?mode=' + mode, uri=True, timeout=2)) as connection:
+            if connection.execute('PRAGMA user_version').fetchone()[0] != 2:
                 raise ValueError('Unsupported session schema.')
-            guard = connection.execute('SELECT session_id FROM workspace_guards WHERE workspace_id=?', (workspace_id,)).fetchone()
-            active = connection.execute("SELECT id FROM sessions WHERE workspace_id=? AND state NOT IN ('COMPLETED','FAILED','INTERRUPTED')", (workspace_id,)).fetchone()
-            if guard or active:
-                error('source_busy', 'Relay execution is active or uncertain. Stop or recover the session before handoff.')
-            if workspace_root is not None:
-                target = os.path.realpath(workspace_root)
-                rows = connection.execute("SELECT s.workspace_path FROM sessions s LEFT JOIN workspace_guards g ON g.session_id=s.id WHERE g.session_id IS NOT NULL OR s.state NOT IN ('COMPLETED','FAILED','INTERRUPTED')").fetchall()
-                for (path,) in rows:
-                    if not isinstance(path, str) or not os.path.isabs(path):
-                        raise ValueError('Invalid guarded workspace path.')
-                    other = os.path.realpath(path)
-                    common = os.path.commonpath((target, other))
-                    if common in (target, other):
-                        error('source_busy', 'An overlapping Relay workspace has active or uncertain execution.')
+            if write:
+                connection.execute('PRAGMA synchronous=FULL')
+            with connection:
+                connection.execute('BEGIN IMMEDIATE' if write else 'BEGIN')
+                yield connection
     except RuntimeError:
         raise
     except Exception:
         error('source_busy', 'Session storage cannot be verified. Restore or recover it before handoff.')
 
 
-def assert_no_overlapping_pending(workspace_id, workspace_root):
+def directory_identity(directory):
+    if not os.path.isabs(directory) or os.path.realpath(directory) != str(directory):
+        error('source_busy', 'Workspace directory identity changed. Inspect recovery before continuing.')
+    entry = os.stat(directory)
+    if not stat.S_ISDIR(entry.st_mode):
+        error('source_busy', 'Workspace directory identity cannot be verified.')
+    return str(entry.st_dev), str(entry.st_ino)
+
+
+def paths_overlap(a, b):
+    if os.path.commonpath((a, b)) in (a, b):
+        return True
+    a, b = Path(a), Path(b)
+    a_identity, b_identity = directory_identity(a), directory_identity(b)
+    return (a_identity == b_identity or any(directory_identity(p) == a_identity for p in b.parents)
+            or any(directory_identity(p) == b_identity for p in a.parents))
+
+
+def check_session_guards(connection, workspace_id, workspace_root):
+    rows = connection.execute("""SELECT s.workspace_id, s.workspace_path, s.workspace_device, s.workspace_inode FROM sessions s
+        LEFT JOIN workspace_guards g ON g.session_id=s.id
+        WHERE g.session_id IS NOT NULL OR s.state NOT IN ('COMPLETED','FAILED','INTERRUPTED')""")
+    for other_id, other_path, device, inode in rows:
+        if device is not None and directory_identity(other_path) != (device, inode):
+            error('source_busy', 'An active session directory changed. Recover the session before handoff.')
+        if other_id == workspace_id or (workspace_root is not None and paths_overlap(str(workspace_root), other_path)):
+            error('source_busy', 'Relay execution is active or uncertain in this or an overlapping workspace. Stop or recover it before handoff.')
+
+
+def check_handoff_guards(connection, workspace_id, workspace_root, transfer=None):
+    rows = connection.execute("""SELECT transfer_id, workspace_id, workspace_path, device, inode
+        FROM handoff_guards WHERE state='ACTIVE'""")
+    for other_transfer, other_id, other_path, device, inode in rows:
+        if directory_identity(other_path) != (device, inode):
+            error('source_busy', 'A reserved handoff directory changed. Inspect recovery before continuing.')
+        if other_transfer != transfer and (other_id == workspace_id or (workspace_root is not None and paths_overlap(str(workspace_root), other_path))):
+            error('source_busy', 'This or an overlapping workspace has a pending handoff. Resume transfer ' + other_transfer + ' first.')
+
+
+def assert_session_idle(workspace_id, workspace_root=None):
+    with guard_database() as connection:
+        if connection is not None:
+            check_session_guards(connection, workspace_id, workspace_root)
+
+
+def reserve_handoff(connection, workspace_id, root, spec):
+    transfer, kind, endpoint, digest = spec.transfer, spec.kind, spec.endpoint, spec.digest
+    row = connection.execute('SELECT * FROM handoff_guards WHERE transfer_id=?', (transfer,)).fetchone()
+    device, inode = directory_identity(root)
+    if row:
+        _, owner, saved_path, saved_device, saved_inode, saved_kind, saved_endpoint, saved_digest, state = row
+        if (owner, saved_path, saved_device, saved_inode, saved_endpoint) != (workspace_id, str(root), device, inode, endpoint):
+            error('checkpoint_mismatch', 'Transfer reservation identity differs.')
+        if (saved_kind, saved_digest) != (kind, digest) and not (kind == 'pull_abort' and saved_kind in ('plain_pull', 'git_pull')):
+            error('checkpoint_mismatch', 'Transfer reservation request differs.')
+        if state != 'ACTIVE':
+            return state, False
+    check_session_guards(connection, workspace_id, root)
+    check_handoff_guards(connection, workspace_id, root, transfer)
+    if not row and kind == 'pull_abort':
+        return None  # A pre-upgrade pull may have a checkpoint but no SQLite reservation.
+    if not row:
+        connection.execute("""INSERT INTO handoff_guards
+            (transfer_id, workspace_id, workspace_path, device, inode, kind, endpoint, request_digest, state)
+            VALUES (?,?,?,?,?,?,?,?,'ACTIVE')""",
+                           (transfer, workspace_id, str(root), device, inode, kind, endpoint, digest))
+    return 'ACTIVE', not row
+
+
+def assert_no_overlapping_pending(workspace_id, workspace_root, transfer=None):
     if workspace_root is None:
         error('source_busy', 'Workspace path cannot be verified before handoff.')
     target = os.path.realpath(workspace_root)
@@ -648,7 +744,7 @@ def assert_no_overlapping_pending(workspace_id, workspace_root):
                 source = pending.get('source_path')
                 if not isinstance(source, str) or not os.path.isabs(source):
                     raise ValueError('Invalid pending handoff path.')
-                if file.parent.name == workspace_id:
+                if file.parent.name == workspace_id and (transfer is None or pending.get('transfer_id') == transfer):
                     continue  # Same workspace must be able to resume its own journal.
                 other = os.path.realpath(source)
                 if os.path.commonpath((target, other)) in (target, other):
@@ -660,27 +756,38 @@ def assert_no_overlapping_pending(workspace_id, workspace_root):
 
 
 @contextmanager
-def turn_lock(workspace_id, workspace_root=None):
+def turn_lock(workspace_id, workspace_root=None, *, spec=None):
     # A remote action may call capture/checkpoint helpers in the same process.
     if workspace_id in _turn_locks:
         yield _turn_locks[workspace_id]
         return
-    controller = Path(os.environ.get('RELAY_CONTROLLER_STATE_DIR', Path.home() / '.relay-v0/controller'))
+    controller = controller_directory()
     lock_path = controller / 'handoff-locks' / (workspace_id + '.lock')
     lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    # Match the PWA reservation gate. Holding it through the remote operation
-    # closes the check/reserve race for overlapping workspace paths.
+    # Match the PWA reservation gate. Capture and legacy operations hold it
+    # until they finish. A managed transfer releases it after SQLite commits.
     with (lock_path.parent / 'workspace-hierarchy.lock').open('a') as gate, lock_path.open('a') as lock:
         try:
             fcntl.flock(gate, fcntl.LOCK_EX | fcntl.LOCK_NB)
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             error('source_busy', 'A Relay chat turn or workspace handoff is active.')
-        assert_session_idle(workspace_id, workspace_root)
-        assert_no_overlapping_pending(workspace_id, workspace_root)
+        assert_no_overlapping_pending(workspace_id, workspace_root, spec.transfer if spec else None)
+        with guard_database(write=spec is not None) as connection:
+            reservation = None
+            if connection is not None:
+                if spec is None:
+                    check_session_guards(connection, workspace_id, workspace_root)
+                    check_handoff_guards(connection, workspace_id, workspace_root)
+                else:
+                    reservation = reserve_handoff(connection, workspace_id, workspace_root, spec)
+        if reservation is not None:
+            # The committed reservation now excludes overlapping operations.
+            # Keep the exact lock to serialize remote steps of this transfer.
+            fcntl.flock(gate, fcntl.LOCK_UN)
         _turn_locks[workspace_id] = lock
         try:
-            yield lock
+            yield reservation
         finally:
             del _turn_locks[workspace_id]
 
@@ -1111,6 +1218,87 @@ def checkpoint(root, workspace_id, request):
         return _original_checkpoint(root, workspace_id, request)
 
 
+def handoff_spec(action, request):
+    if action == 'checkpoint':
+        phase = request.get('action')
+        if phase == 'get':
+            return None
+        kinds = {'begin_import': 'import', 'init': 'import', 'abort_import': 'import', 'begin_pull': 'plain_pull', 'prepare': 'plain_pull',
+                 'commit': 'plain_pull', 'abort': 'pull_abort'}
+        if phase not in kinds:
+            error('invalid_request', 'Unknown checkpoint action.')
+        transfer = request.get('transfer_id') or request.get('checkpoint', {}).get('transfer_id', '')
+        endpoint, digest, kind = request.get('endpoint', ''), '', kinds[phase]
+        terminal = {'init': 'COMPLETED', 'commit': 'COMPLETED', 'abort': 'ABORTED', 'abort_import': 'ABORTED'}.get(phase)
+    elif action in ('git_begin', 'git_apply', 'git_ack_push', 'git_prepare_pull', 'git_ack_pull', 'batch_begin', 'batch_apply', 'push_one'):
+        transfer = request['proposed']['transfer_id']
+        endpoint = request['base']['endpoint']
+        if action.startswith('git_'):
+            kind = 'git_pull' if action in ('git_prepare_pull', 'git_ack_pull') else 'git_push'
+        else:
+            kind = 'batch_push' if action.startswith('batch_') else 'file_push'
+        digest = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        terminal = 'COMPLETED' if action in ('git_ack_push', 'git_ack_pull', 'batch_apply', 'push_one') else None
+    else:
+        return None
+    if not re.fullmatch(r'[0-9a-f]{32}', transfer) or not re.fullmatch(r'[0-9a-f]{64}', endpoint):
+        error('invalid_request', 'Invalid handoff reservation identity.')
+    return HandoffRequest(transfer, kind, endpoint, digest, terminal)
+
+
+def replay_handoff(root, workspace_id, action, request, spec, state):
+    transfer = spec.transfer
+    current = checkpoint(root, workspace_id, {'action': 'get', 'endpoint': spec.endpoint})
+    if state == 'ABORTED':
+        if action == 'checkpoint' and request['action'] in ('abort', 'abort_import'):
+            return current
+        error('recovery_required', 'This transfer was aborted. Start a new transfer.')
+    proposed = current['checkpoint']
+    if not proposed or proposed['transfer_id'] != transfer or current['pending'] is not None:
+        error('checkpoint_mismatch', 'The completed transfer is no longer the current checkpoint.')
+    if action == 'checkpoint':
+        if request['action'] in ('abort', 'abort_import') or request.get('checkpoint', proposed) != proposed:
+            error('checkpoint_mismatch', 'The request differs from the completed transfer.')
+        return current
+    if request['proposed'] != proposed:
+        error('checkpoint_mismatch', 'The request differs from the completed transfer.')
+    directory = Path.home() / '.relay-v0' / 'batch-pushes' / transfer
+    if action == 'git_begin':
+        return {'directory': str(directory), 'upload': False}
+    if action == 'batch_begin':
+        return {'phase': 'acknowledged', 'upload_path': str(directory / 'incoming'), 'transfer_id': transfer}
+    if action == 'push_one':
+        directory = Path.home() / '.relay-v0' / 'pushes' / transfer
+        return {'status': 'SUCCESS', 'transfer_id': transfer, 'checkpoint': proposed, 'recovery_path': str(directory / 'file')}
+    return {'status': 'SUCCESS', 'transfer_id': transfer, 'checkpoint': proposed,
+            'recovery_path': None if spec.kind == 'git_pull' else str(directory)}
+
+
+def dispatch_handoff(root, workspace_id, action, request):
+    spec = handoff_spec(action, request)
+    with turn_lock(workspace_id, root, spec=spec) as reservation:
+        if reservation is not None and reservation[0] != 'ACTIVE':
+            return replay_handoff(root, workspace_id, action, request, spec, reservation[0])
+        try:
+            if action.startswith('git_'):
+                result = git_handoff_remote(root, workspace_id, action, request)
+            elif action == 'checkpoint':
+                result = checkpoint(root, workspace_id, request)
+            else:
+                result = {'batch_begin': batch_begin, 'batch_apply': batch_apply, 'push_one': push_one}[action](root, workspace_id, request)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            # These initial steps never publish to the workspace or advance the
+            # checkpoint. Release only a reservation created by this failed call.
+            if reservation == ('ACTIVE', True) and (action in ('git_begin', 'batch_begin') or request.get('action') in ('begin_import', 'begin_pull')):
+                with guard_database(write=True) as connection:
+                    connection.execute('DELETE FROM handoff_guards WHERE transfer_id=?', (spec.transfer,))
+            raise
+        if reservation is not None and spec.terminal_state is not None:
+            with guard_database(write=True) as connection:
+                connection.execute("UPDATE handoff_guards SET state=? WHERE transfer_id=? AND state='ACTIVE'", (spec.terminal_state, spec.transfer))
+        return result
+
+
 def main():
     try:
         workspace_id, action = sys.argv[1:3]
@@ -1118,22 +1306,22 @@ def main():
             rules = read_policy(Path(action))[1]
             print(json.dumps([relayignore_disposition(path, rules) for path in sys.argv[3:]]))
             return
+        controller = controller_directory()
+        if '__file__' not in globals() and ((controller / 'sessions-required').exists() or (controller / 'sessions/sessions.sqlite').exists()):
+            # Do not let a desktop-supplied helper choose the policy on a managed VM.
+            # Read/validate the store first so damage still reports the recovery error.
+            with guard_database():
+                error('helper_upgrade_required', 'Install or configure the VM-side Relay handoff helper before connecting this CLI.')
         if action == 'list':
             print(json.dumps({'schema_version': 1, 'workspaces': [{'id': hashlib.sha256(os.fsencode(str(root))).hexdigest()[:16], 'name': root.name} for root in workspace_roots()]}, ensure_ascii=True))
             return
         root = resolve_workspace(workspace_id)
-        if action in ('git_begin', 'git_apply', 'git_ack_push', 'git_prepare_pull', 'git_ack_pull'):
-            result = git_handoff_remote(root, workspace_id, action, json.load(sys.stdin))
-        elif action == 'batch_begin':
-            result = batch_begin(root, workspace_id, json.load(sys.stdin))
-        elif action == 'batch_apply':
-            result = batch_apply(root, workspace_id, json.load(sys.stdin))
+        if action in ('git_begin', 'git_apply', 'git_ack_push', 'git_prepare_pull', 'git_ack_pull', 'batch_begin', 'batch_apply', 'push_one', 'checkpoint'):
+            request = json.load(sys.stdin)
+            result = (checkpoint(root, workspace_id, request) if action == 'checkpoint' and request.get('action') == 'get'
+                      else dispatch_handoff(root, workspace_id, action, request))
         elif action == 'export_manifest':
             result = export_manifest(root, workspace_id, json.load(sys.stdin))
-        elif action == 'push_one':
-            result = push_one(root, workspace_id, json.load(sys.stdin))
-        elif action == 'checkpoint':
-            result = checkpoint(root, workspace_id, json.load(sys.stdin))
         elif action in ('preview', 'git_preview'):
             if action == 'git_preview':
                 direct_git_directory(root)

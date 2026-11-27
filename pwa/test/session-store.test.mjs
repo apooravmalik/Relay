@@ -42,6 +42,21 @@ test('parent and child tasks conflict while sibling workspaces remain independen
   assert.throws(() => reserve(store, { workspaceId: 'parent-again', workspacePath: '/workspace/project' }), /overlapping workspace/);
   store.transition(child.session.id, 'INTERRUPTED', null, { stopped: true });
 }));
+test('migrating an initialized v1 store keeps its active session guarded', async () => fixture(async (store, directory) => {
+  const { session } = reserve(store);
+  store.db.exec(`DROP TABLE handoff_guards;
+    ALTER TABLE sessions DROP COLUMN workspace_device;
+    ALTER TABLE sessions DROP COLUMN workspace_inode;
+    PRAGMA user_version=1;`);
+  store.close();
+  const migrated = new SessionStore(directory);
+  try {
+    assert.equal(migrated.raw(session.id).state, 'STARTING');
+    assert.throws(() => reserve(migrated, { workspaceId: 'child', workspacePath: '/workspace/child' }), /overlapping workspace/);
+    migrated.transition(session.id, 'INTERRUPTED', null, { stopped: true });
+    assert.equal(reserve(migrated, { workspaceId: 'child', workspacePath: '/workspace/child' }).created, true);
+  } finally { migrated.close(); }
+}));
 test('events, state and guard changes are transactional and only verified finalization unlocks', async () => fixture(async (store) => {
   const { session } = reserve(store);
   store.transition(session.id, 'RUNNING');

@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, chmodSync, existsSync, lstatSync, openSync, closeSync, fsyncSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, chmodSync, existsSync, lstatSync, openSync, closeSync, fsyncSync, writeFileSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 export const terminalStates = new Set(['COMPLETED', 'FAILED', 'INTERRUPTED']);
@@ -22,6 +22,25 @@ function overlaps(a, b) {
   };
   return within(a, b) || within(b, a);
 }
+function sharesDirectory(a, b) {
+  const contains = (ancestor, child) => {
+    const root = statSync(ancestor, { bigint: true });
+    for (let current = child; ; current = path.dirname(current)) {
+      const entry = statSync(current, { bigint: true });
+      if (entry.dev === root.dev && entry.ino === root.ino) return true;
+      if (path.dirname(current) === current) return false;
+    }
+  };
+  try { return contains(a, b) || contains(b, a); }
+  catch { throw new SessionError('Workspace directory identity cannot be verified.'); }
+}
+export function directoryIdentity(directory) {
+  try {
+    const entry = statSync(directory, { bigint: true });
+    if (entry.isDirectory() && realpathSync(directory) === directory) return [String(entry.dev), String(entry.ino)];
+  } catch {}
+  throw new SessionError('Workspace directory identity cannot be verified.');
+}
 
 export class SessionStore {
   constructor(directory, { now = Date.now, maxSessionBytes = 64 * 1024 ** 2, maxTotalBytes = 1024 ** 3, requiredMarker } = {}) {
@@ -42,7 +61,7 @@ export class SessionStore {
       if (!existed) this.db.exec('PRAGMA auto_vacuum=INCREMENTAL');
       this.db.exec('PRAGMA busy_timeout=2000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA journal_size_limit=8388608; PRAGMA wal_autocheckpoint=256;');
       const version = this.db.prepare('PRAGMA user_version').get().user_version;
-      if (version !== 0 && version !== 1) throw new SessionError('Unsupported session schema. Do not downgrade the controller.', 503);
+      if (![0, 1, 2].includes(version)) throw new SessionError('Unsupported session schema. Do not downgrade the controller.', 503);
       if (version === 0 && existed) throw new SessionError('Uninitialized or damaged session database. Recovery is required.', 503);
       if (version === 0) { this.db.exec(`BEGIN IMMEDIATE;
         CREATE TABLE sessions (
@@ -63,6 +82,15 @@ export class SessionStore {
         CREATE INDEX session_workspace ON sessions(owner,workspace_id,created_at);
         CREATE TABLE preview_ports (port INTEGER PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, url TEXT);
         PRAGMA user_version=1; COMMIT;`); }
+      if (version < 2) this.transaction(() => this.db.exec(`
+        ALTER TABLE sessions ADD COLUMN workspace_device TEXT;
+        ALTER TABLE sessions ADD COLUMN workspace_inode TEXT;
+        CREATE TABLE handoff_guards (
+          transfer_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, workspace_path TEXT NOT NULL,
+          device TEXT NOT NULL, inode TEXT NOT NULL, kind TEXT NOT NULL, endpoint TEXT NOT NULL, request_digest TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('ACTIVE','COMPLETED','ABORTED')));
+        CREATE INDEX active_handoff_guards ON handoff_guards(state);
+        PRAGMA user_version=2;`));
       if (this.db.prepare('PRAGMA quick_check').get().quick_check !== 'ok') throw new SessionError('Session storage integrity check failed.', 503);
       if (this.db.prepare('PRAGMA foreign_key_check').get()) throw new SessionError('Session storage references are inconsistent.', 503);
       if (this.db.prepare(`SELECT s.id FROM sessions s LEFT JOIN workspace_guards g ON g.session_id=s.id
@@ -110,19 +138,35 @@ export class SessionStore {
     const input = { text: body.text.trim(), threadId: body.threadId || null, model: body.model || null, effort: body.effort || null, createdAt: body.createdAt };
     return { input, digest: createHash('sha256').update(JSON.stringify(input)).digest('hex') };
   }
-  reserve({ owner, workspace, key, input, digest, bootId }) {
+  assertWorkspaceIdle(workspace, workspaceIdentity) {
+    if (this.db.prepare('SELECT 1 FROM workspace_guards WHERE workspace_id=?').get(workspace.id) || this.db.prepare("SELECT 1 FROM sessions WHERE workspace_id=? AND state NOT IN ('COMPLETED','FAILED','INTERRUPTED')").get(workspace.id)) throw new SessionError('Workspace has active or uncertain execution.');
+    const guarded = this.db.prepare("SELECT s.workspace_path, s.workspace_device, s.workspace_inode FROM sessions s LEFT JOIN workspace_guards g ON g.session_id=s.id WHERE g.session_id IS NOT NULL OR s.state NOT IN ('COMPLETED','FAILED','INTERRUPTED')").all();
+    for (const row of guarded) {
+      if (row.workspace_device !== null) {
+        const [device, inode] = directoryIdentity(row.workspace_path);
+        if (device !== row.workspace_device || inode !== row.workspace_inode) throw new SessionError('An active workspace identity changed. Recover the session before continuing.');
+      }
+      if (overlaps(row.workspace_path, workspace.path) || (workspaceIdentity && row.workspace_device !== null && sharesDirectory(row.workspace_path, workspace.path))) throw new SessionError('An overlapping workspace has active or uncertain execution.');
+    }
+    const handoffs = this.db.prepare("SELECT * FROM handoff_guards WHERE state='ACTIVE'").all();
+    for (const handoff of handoffs) {
+      const [device, inode] = directoryIdentity(handoff.workspace_path);
+      if (device !== handoff.device || inode !== handoff.inode) throw new SessionError('A pending handoff workspace identity changed. Recover the handoff before continuing.');
+      if (handoff.workspace_id === workspace.id || overlaps(handoff.workspace_path, workspace.path) || sharesDirectory(handoff.workspace_path, workspace.path)) throw new SessionError('Workspace or overlapping workspace has a pending handoff. Resume or recover it before continuing.');
+    }
+  }
+  reserve({ owner, workspace, key, input, digest, bootId, workspaceIdentity }) {
     return this.transaction(() => {
       const prior = this.prior(owner, workspace.id, key, digest);
       if (prior) return { session: prior, created: false };
       if (input.createdAt < this.now() - day || input.createdAt > this.now() + 60000) throw new SessionError('This request is stale. Review the conversation before sending a new prompt.', 410, 'STALE_REQUEST');
-      if (this.db.prepare('SELECT 1 FROM workspace_guards WHERE workspace_id=?').get(workspace.id) || this.db.prepare("SELECT 1 FROM sessions WHERE workspace_id=? AND state NOT IN ('COMPLETED','FAILED','INTERRUPTED')").get(workspace.id)) throw new SessionError('Workspace has active or uncertain execution.');
-      const guarded = this.db.prepare("SELECT s.workspace_path FROM sessions s LEFT JOIN workspace_guards g ON g.session_id=s.id WHERE g.session_id IS NOT NULL OR s.state NOT IN ('COMPLETED','FAILED','INTERRUPTED')").all();
-      if (guarded.some((row) => overlaps(row.workspace_path, workspace.path))) throw new SessionError('An overlapping workspace has active or uncertain execution.');
+      this.assertWorkspaceIdle(workspace, workspaceIdentity);
       if (this.db.prepare('SELECT COUNT(*) AS n FROM workspace_guards').get().n >= 2) throw new SessionError('Two tasks are already active or uncertain. Finish or recover one first.');
       if (this.db.prepare('SELECT COALESCE(SUM(event_bytes),0) AS n FROM sessions').get().n > this.maxTotalBytes - 65536) throw new SessionError('Session storage budget is full. No new task was started.', 507);
       const id = randomUUID(), now = this.now();
-      this.db.prepare(`INSERT INTO sessions(id,owner,workspace_id,workspace_path,request_key,request_digest,requested_at,thread_id,model,effort,state,created_at,updated_at,boot_id)
-        VALUES(?,?,?,?,?,?,?,?,?,?,'STARTING',?,?,?)`).run(id, owner, workspace.id, workspace.path, key, digest, input.createdAt, input.threadId, input.model, input.effort, now, now, bootId);
+      const [device, inode] = workspaceIdentity ?? [null, null];
+      this.db.prepare(`INSERT INTO sessions(id,owner,workspace_id,workspace_path,request_key,request_digest,requested_at,thread_id,model,effort,state,created_at,updated_at,boot_id,workspace_device,workspace_inode)
+        VALUES(?,?,?,?,?,?,?,?,?,?,'STARTING',?,?,?,?,?)`).run(id, owner, workspace.id, workspace.path, key, digest, input.createdAt, input.threadId, input.model, input.effort, now, now, bootId, device, inode);
       this.db.prepare('INSERT INTO workspace_guards VALUES(?,?)').run(workspace.id, id);
       this.insertEvent(id, 'input', { text: input.text });
       this.insertEvent(id, 'status', { state: 'STARTING', phase: 'starting' });

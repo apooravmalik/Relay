@@ -24,6 +24,12 @@ const token = randomUUID().replaceAll('-', ''), unit = `relay-e2e-crash-${token}
 let remote, tunnel, browser, context, page, session, workspace, started = false;
 try {
   remote = await ssh('python3', '-c', "import tempfile,sys; from pathlib import Path; p=Path(sys.argv[1]); assert p.is_dir(); root=Path(tempfile.mkdtemp(prefix='crash-e2e-',dir=p)); (root/'workspace').mkdir(); print(root)", testRoot);
+  const helperSettings = [
+    `RELAY_CONTROLLER_STATE_DIR=${quote(`${remote}/controller`)}`,
+    `RELAY_WORKSPACE_REGISTRY_FILE=${quote(`${remote}/registry.json`)}`,
+    `RELAY_WORKSPACE_ROOTS=${quote(`${remote}/workspace`)}`,
+  ].join('\n') + '\n';
+  await ssh('python3', '-c', "import sys; from pathlib import Path; p=Path(sys.argv[1]); (p/'relay-handoff').symlink_to(sys.argv[2]); (p/'relay-handoff.env').write_text(sys.argv[3])", remote, `${checkout}/deploy/relay-handoff`, helperSettings);
   const remotePort = await ssh('python3', '-c', "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()");
   const localPort = await new Promise((resolve, reject) => { const server = createServer(); server.once('error', reject); server.listen(0, '127.0.0.1', () => { const port = server.address().port; server.close(() => resolve(port)); }); });
   const user = await ssh('id', '-un');
@@ -54,7 +60,10 @@ try {
   await ssh('sudo', '-n', 'systemctl', 'kill', '--kill-who=main', '--signal=SIGKILL', `${unit}.service`);
   await until(async () => (await ssh('systemctl', 'is-active', `${unit}.service`).catch(() => 'inactive')) !== 'active', 'controller crash');
   const destination = await mkdtemp(path.join(tmpdir(), 'relay-crash-import-'));
-  const env = { ...process.env, RELAY_REMOTE_CONTROLLER_STATE_DIR: `${remote}/controller`, RELAY_REMOTE_WORKSPACE_REGISTRY_FILE: `${remote}/registry.json`, RELAY_REMOTE_WORKSPACE_ROOTS: `${remote}/workspace` };
+  const env = { ...process.env, RELAY_REMOTE_HELPER: `${remote}/relay-handoff` };
+  delete env.RELAY_REMOTE_CONTROLLER_STATE_DIR;
+  delete env.RELAY_REMOTE_WORKSPACE_REGISTRY_FILE;
+  delete env.RELAY_REMOTE_WORKSPACE_ROOTS;
   let transfer; try { transfer = await exec('./relay', ['pull', '--workspace', workspace.id, '--into', destination, '--vm', vm, '--json'], { cwd: process.cwd(), env, timeout: 120000 }); }
   catch (error) { transfer = { code: error.code, stdout: error.stdout || '', stderr: error.stderr || '' }; }
   assert.ok(transfer.code, 'SSH import must fail while the controller is absent');

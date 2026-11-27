@@ -44,6 +44,14 @@ class ImportPreviewTests(unittest.TestCase):
     def run_push(self, project, path, *extra):
         return subprocess.run([str(RELAY), 'push', '--workspace', self.workspace_id, '--project', str(project), '--file', path, '--json', *extra], env=self.env, capture_output=True, text=True)
 
+    def enable_managed_handoffs(self):
+        controller = self.base / 'controller'
+        module = (RELAY.parent / 'pwa/lib/session-store.mjs').as_uri()
+        script = (f'import {{ SessionStore }} from {json.dumps(module)};'
+                  "const root=process.argv[1]; new SessionStore(root+'/sessions',{requiredMarker:root+'/sessions-required'}).close();")
+        subprocess.run(['node', '--input-type=module', '-e', script, str(controller)], check=True, capture_output=True)
+        self.env.update(RELAY_CONTROLLER_STATE_DIR=str(controller), RELAY_REMOTE_HELPER=str(RELAY.parent / 'deploy/relay-handoff'))
+
     def test_custom_remote_controller_is_used_for_capture_guards(self):
         controller = self.base / 'candidate state'
         controller.mkdir()
@@ -64,7 +72,16 @@ class ImportPreviewTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('Set all three', result.stdout)
 
+    def test_managed_store_requires_the_installed_helper(self):
+        self.enable_managed_handoffs()
+        del self.env['RELAY_REMOTE_HELPER']
+        result = self.run_relay('--workspace', self.workspace_id, '--into', str(self.dest), '--json')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout)['error'], 'helper_upgrade_required')
+        self.assertFalse((self.dest / self.source.name).exists())
+
     def test_plain_policy_import_and_update_preserve_excluded_file(self):
+        self.enable_managed_handoffs()
         (self.source / '.relayignore').write_text('exclude secret\n')
         (self.source / 'secret').write_text('VM secret')
         (self.source / 'file').write_text('initial')
@@ -114,6 +131,7 @@ class ImportPreviewTests(unittest.TestCase):
         self.assertFalse((self.dest / 'source').exists())
 
     def test_plain_single_file_push_preserves_runtime_and_repeat_pull(self):
+        self.enable_managed_handoffs()
         (self.source / '.env').write_text('TOKEN=secret')
         (self.source / 'file').write_text('old')
         self.assertEqual(self.run_relay('--workspace', self.workspace_id, '--into', str(self.dest), '--json').returncode, 0)
@@ -555,6 +573,7 @@ class ImportPreviewTests(unittest.TestCase):
         self.assertEqual((Path(json.loads(resumed.stdout)['recovery_path']) / 'file').read_text(), 'first')
 
     def test_abort_interrupted_download_leaves_original_and_remote_base(self):
+        self.enable_managed_handoffs()
         (self.source / 'file').write_text('first')
         self.assertEqual(self.run_relay('--workspace', self.workspace_id, '--into', str(self.dest), '--json').returncode, 0)
         project = self.dest / 'source'
@@ -569,6 +588,22 @@ class ImportPreviewTests(unittest.TestCase):
         self.assertEqual((project / 'file').read_text(), 'first')
         retry = self.run_relay('--workspace', self.workspace_id, '--into', str(project), '--update', '--json')
         self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
+
+    def test_abort_interrupted_first_import_releases_managed_reservation(self):
+        self.enable_managed_handoffs()
+        (self.source / 'file').write_text('workspace data')
+        self.env['RELAY_TEST_INTERRUPT'] = '1'
+        first = self.run_relay('--workspace', self.workspace_id, '--into', str(self.dest), '--json')
+        self.assertIn('Transfer interrupted', first.stdout)
+        pending = next((self.base / '.relay-v0/imports').glob('*.pending.json'))
+        transfer = json.loads(pending.read_text())['manifest']['transfer_id']
+        second = self.run_relay('--abort-import', transfer, '--json')
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(json.loads(second.stdout)['status'], 'ABORTED')
+        self.assertFalse((self.dest / self.source.name).exists())
+        del self.env['RELAY_TEST_INTERRUPT']
+        third = self.run_relay('--workspace', self.workspace_id, '--into', str(self.dest), '--json')
+        self.assertEqual(third.returncode, 0, third.stdout + third.stderr)
 
     def test_update_rejects_unpaired_and_git_destinations(self):
         other = self.dest / 'other'
@@ -614,6 +649,7 @@ class ImportPreviewTests(unittest.TestCase):
         self.assertEqual((self.source / 'file').read_text(), 'initial')
 
     def test_git_round_trips_policy_and_existing_commit(self):
+        self.enable_managed_handoffs()
         def git(path, *args):
             return subprocess.check_output(['git', '-C', str(path), *args]).strip()
         git(self.source, 'init', '-q')
@@ -684,6 +720,7 @@ class ImportPreviewTests(unittest.TestCase):
         assert_equal_state()
 
     def test_git_recovery_and_scoped_merge_approval(self):
+        self.enable_managed_handoffs()
         git = lambda *args: subprocess.check_output(['git', '-C', str(self.source), *args])
         git('init', '-q')
         (self.source / 'text.txt').write_text('shared\n')

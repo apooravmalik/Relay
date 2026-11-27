@@ -9,10 +9,11 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const { RELAY_PLAYWRIGHT_MODULE: modulePath, RELAY_E2E_URL: base, RELAY_E2E_ROOT_ID: rootId,
-  RELAY_E2E_VM: vm, RELAY_E2E_BROWSER_EXECUTABLE: executablePath } = process.env;
+  RELAY_E2E_VM: vm, RELAY_E2E_BROWSER_EXECUTABLE: executablePath, RELAY_REMOTE_HELPER: installedHelper,
+  RELAY_E2E_REMOTE_WORKSPACE_ROOT: fixtureRoot } = process.env;
 if (!modulePath || !base || !rootId || !vm || process.env.RELAY_E2E_DISPOSABLE !== '1' ||
-    !process.env.RELAY_REMOTE_CONTROLLER_STATE_DIR || !process.env.RELAY_REMOTE_WORKSPACE_REGISTRY_FILE || !process.env.RELAY_REMOTE_WORKSPACE_ROOTS) {
-  throw new Error('Set the candidate URL, root ID, SSH alias, Playwright module, all three RELAY_REMOTE_* paths, and RELAY_E2E_DISPOSABLE=1.');
+    !installedHelper?.startsWith('/')) {
+  throw new Error('Set the candidate URL, root ID, SSH alias, Playwright module, absolute RELAY_REMOTE_HELPER, and RELAY_E2E_DISPOSABLE=1.');
 }
 const exec = promisify(execFile), { chromium } = await import(pathToFileURL(modulePath));
 const browser = await chromium.launch({ headless: true, ...(executablePath ? { executablePath } : {}), args: ['--no-sandbox'] });
@@ -49,8 +50,8 @@ try {
   const created = await context.request.post(new URL('/api/projects', base).href, { data: { action: 'create', rootId, name: marker } });
   assert.equal(created.status(), 201); workspace = (await created.json()).workspace;
   if (gitMode) {
-    assert.ok(!process.env.RELAY_REMOTE_WORKSPACE_ROOTS.includes(':'), 'Git fixture requires one explicit remote root');
-    const remotePath = `${process.env.RELAY_REMOTE_WORKSPACE_ROOTS}/${marker}`;
+    assert.ok(fixtureRoot?.startsWith('/'), 'Set RELAY_E2E_REMOTE_WORKSPACE_ROOT to the absolute Git fixture root.');
+    const remotePath = `${fixtureRoot}/${marker}`;
     await sshPython("from pathlib import Path; import subprocess,sys; p=Path(sys.argv[1]); (p/'base.txt').write_text('fixture\\n'); subprocess.run(['git','-C',str(p),'init','-q'],check=True); subprocess.run(['git','-C',str(p),'add','base.txt'],check=True); subprocess.run(['git','-C',str(p),'-c','user.name=Relay Fixture','-c','user.email=fixture@example.invalid','commit','-qm','fixture'],check=True)", remotePath);
   }
   const childCreated = await context.request.post(new URL('/api/projects', base).href, { data: { action: 'create', rootId, parentPath: marker, name: 'nested' } });
@@ -96,7 +97,7 @@ try {
   assert.equal(imported.code, 0, imported.output + imported.error);
   if (gitMode) {
     const destination = JSON.parse(imported.output).destination;
-    const remoteHead = await sshPython("import subprocess,sys; print(subprocess.check_output(['git','-C',sys.argv[1],'rev-parse','HEAD'],text=True).strip())", `${process.env.RELAY_REMOTE_WORKSPACE_ROOTS}/${marker}`);
+    const remoteHead = await sshPython("import subprocess,sys; print(subprocess.check_output(['git','-C',sys.argv[1],'rev-parse','HEAD'],text=True).strip())", `${fixtureRoot}/${marker}`);
     const localHead = (await exec('git', ['-C', destination, 'rev-parse', 'HEAD'])).stdout.trim();
     assert.equal(localHead, remoteHead, 'Imported Git HEAD must match the VM');
     assert.equal((await exec('git', ['-C', destination, 'show', ':base.txt'])).stdout, 'fixture\n');

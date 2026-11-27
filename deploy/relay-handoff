@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+# Put VM-owned settings beside the installed entry point (or its symlink).
+config=$(dirname -- "$0")/relay-handoff.env
+if [ -f "$config" ]; then
+    set -a
+    . "$config"
+    set +a
+fi
+export RELAY_HANDOFF_MANAGED=1
+script=$(readlink -f -- "$0")
+exec python3 "$(dirname -- "$script")/../relay_lib/export_workspace.py" "$@"

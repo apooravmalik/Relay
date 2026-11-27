@@ -297,10 +297,12 @@ export function createRelayServer(dependencies = {}) {
         return writeJson(response, 200, await options.workspaceDiff(workspace.path, url.searchParams.get('path')));
       }
       if (request.method === 'POST' && suffix.length === 1 && suffix[0] === 'uploads') {
-        return writeJson(response, 201, { upload: await options.saveWorkspaceUpload(workspace.path, {
+        const input = {
           name: uploadName(request),
           content: await uploadBody(request),
-        }) });
+        };
+        const upload = await sessions.saveAttachment(workspace, () => options.saveWorkspaceUpload(workspace.path, input));
+        return writeJson(response, 201, { upload });
       }
       if (request.method === 'POST' && suffix.length === 1 && suffix[0] === 'preview') {
         const { port, sessionId } = await requestBody(request);

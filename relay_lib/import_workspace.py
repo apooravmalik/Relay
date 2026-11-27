@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Import an exported VM workspace into a new local directory."""
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -39,7 +41,8 @@ def ssh_command(vm):
 
 
 def remote(ssh, host, workspace, action, request=None):
-    command = 'python3 -c ' + shlex.quote(HELPER) + ' ' + shlex.quote(workspace) + ' ' + action
+    arguments = ' ' + shlex.quote(workspace) + ' ' + shlex.quote(action)
+    command = 'python3 -c ' + shlex.quote(HELPER) + arguments
     # A non-default controller must use the same guard database and registry as
     # its PWA. Require the full configuration together to avoid partial routing.
     names = {
@@ -48,6 +51,13 @@ def remote(ssh, host, workspace, action, request=None):
         'RELAY_REMOTE_WORKSPACE_ROOTS': 'RELAY_WORKSPACE_ROOTS',
     }
     configured = {target: os.environ.get(source) for source, target in names.items()}
+    installed = os.environ.get('RELAY_REMOTE_HELPER')
+    if installed:
+        if not installed.startswith('/') or '\0' in installed or '\n' in installed:
+            raise ValueError('RELAY_REMOTE_HELPER must be an absolute VM path.')
+        if any(value is not None for value in configured.values()):
+            raise ValueError('Configure controller and workspace paths in the installed VM helper environment.')
+        command = 'exec ' + shlex.quote(installed) + arguments
     if any(value is not None for value in configured.values()):
         if not all(configured.values()):
             raise ValueError('Set all three RELAY_REMOTE_CONTROLLER_STATE_DIR, RELAY_REMOTE_WORKSPACE_REGISTRY_FILE and RELAY_REMOTE_WORKSPACE_ROOTS together.')
@@ -56,6 +66,9 @@ def remote(ssh, host, workspace, action, request=None):
             if any(not path.startswith('/') or '\0' in path or '\n' in path for path in paths):
                 raise ValueError('Remote controller and workspace paths must be absolute.')
         command = 'env ' + ' '.join(shlex.quote(name + '=' + value) for name, value in configured.items()) + ' ' + command
+    elif not installed:
+        command = ('if test -x "$HOME/.relay-v0/bin/relay-handoff"; then exec "$HOME/.relay-v0/bin/relay-handoff"'
+                   + arguments + '; else ' + command + '; fi')
     result = subprocess.run([*ssh, host, command], stdout=subprocess.PIPE, stderr=subprocess.PIPE, input=json.dumps(request).encode() if request is not None else None)
     try: data = json.loads(result.stdout)
     except ValueError: raise ValueError('Could not obtain a response over SSH; check connectivity and remote Python and Git.')
@@ -207,10 +220,28 @@ def verify_project(project, manifest, ignore_paths=()):
         if meta['branch'] and git(project, 'symbolic-ref', 'HEAD').decode().strip() != meta['branch']: raise ValueError('Git branch verification failed.')
 
 
+@contextmanager
+def import_lock(state_file):
+    with state_file.with_suffix('.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError('Another process is resuming or aborting this import.') from None
+        yield
+
+
 def finish_transfer(args, state, state_file):
     manifest = state['manifest']
     if not manifest['git'].get('policy_digest') and any(entry.get('path') == '.relayignore' for entry in manifest['entries']):
         raise ValueError('unsupported_policy: Retained snapshot contains .relayignore; its rules cannot yet be enforced.')
+    with import_lock(state_file):
+        if not state_file.is_file() or json.loads(state_file.read_text()) != state:
+            raise ValueError('Import state changed. Inspect the transfer before retrying.')
+        return _finish_transfer(args, state, state_file)
+
+
+def _finish_transfer(args, state, state_file):
+    manifest = state['manifest']
     transfer = manifest['transfer_id']
     staging = Path(state['staging'])
     destination = Path(state['destination'])
@@ -225,6 +256,8 @@ def finish_transfer(args, state, state_file):
         verify_payload(staging / 'payload', manifest)
         verify_project(destination, manifest)
         return complete_transfer(args, state, state_file)
+    pair = update_workspace.initial_pair(state, write_json_atomic)
+    update_workspace.remote_cp(sys.modules[__name__], args.vm, pair, 'begin_import', update_workspace.cp(pair))
     payload = staging / 'payload'
     payload.mkdir(exist_ok=True)
     print('relay: transferring snapshot ' + transfer, file=sys.stderr)
@@ -273,9 +306,26 @@ def complete_transfer(args, state, state_file):
     print(json.dumps(receipt, ensure_ascii=True, indent=None if args.json else 2))
     return 0
 
+
+def abort_import(args, state_file):
+    with import_lock(state_file):
+        archived = state_file.with_name(args.abort_import + '.aborted.json')
+        state = json.loads((state_file if state_file.exists() else archived).read_text())
+        if state['vm'] != args.vm or state['manifest']['transfer_id'] != args.abort_import:
+            raise ValueError('Transfer identity or VM does not match.')
+        if state_file.exists():
+            if state['phase'] != 'transferring' or os.path.lexists(state['destination']):
+                raise ValueError('Publication may have started. Resume rather than abort.')
+            pair = update_workspace.initial_pair(state, write_json_atomic)
+            update_workspace.remote_cp(sys.modules[__name__], args.vm, pair, 'abort_import', transfer_id=args.abort_import)
+            os.replace(state_file, archived)
+        print(json.dumps({'status': 'ABORTED', 'transfer_id': args.abort_import, 'staging': state['staging']}))
+        return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='relay pull')
-    parser.add_argument('--workspace'); parser.add_argument('--into'); parser.add_argument('--name'); parser.add_argument('--resume')
+    parser.add_argument('--workspace'); parser.add_argument('--into'); parser.add_argument('--name'); parser.add_argument('--resume'); parser.add_argument('--abort-import')
     parser.add_argument('--update', action='store_true'); parser.add_argument('--resume-update'); parser.add_argument('--inspect-update'); parser.add_argument('--abort-update')
     parser.add_argument('--vm', default='relay-v0'); parser.add_argument('--dry-run', action='store_true'); parser.add_argument('--json', action='store_true'); parser.add_argument('--list', action='store_true')
     parser.add_argument('--commit')
@@ -283,6 +333,16 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if (args.commit or args.expect) and not args.update:
         parser.error('--commit and --expect require --update')
+    if args.abort_import is not None:
+        if any((args.workspace, args.into, args.name, args.resume, args.update, args.resume_update, args.inspect_update, args.abort_update, args.dry_run, args.list)):
+            parser.error('--abort-import cannot be combined with other transfer options')
+        if len(args.abort_import) != 32 or any(c not in '0123456789abcdef' for c in args.abort_import):
+            parser.error('invalid transfer ID')
+        state_file = Path.home() / '.relay-v0' / 'imports' / (args.abort_import + '.pending.json')
+        try:
+            return abort_import(args, state_file)
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+            return fail(args, 'abort_failed', str(exc))
     if args.inspect_update or args.abort_update:
         if sum(bool(x) for x in (args.inspect_update, args.abort_update, args.resume_update, args.workspace, args.into, args.name, args.resume, args.update, args.dry_run, args.list)) != 1: parser.error('inspect/abort cannot be combined with other transfer options')
         try: return update_workspace.manage(args, sys.modules[__name__])
@@ -353,7 +413,7 @@ def main(argv=None):
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
         text = str(exc)
         code, sep, detail = text.partition(': ')
-        if sep and code in ('workspace_not_found', 'unsupported_git_state', 'unsupported_policy', 'invalid_policy', 'policy_mismatch', 'excluded_tracked_file', 'unsupported_file', 'source_changed', 'source_busy', 'permission_denied', 'secret_detected', 'scan_limit'):
+        if sep and code in ('workspace_not_found', 'unsupported_git_state', 'unsupported_policy', 'invalid_policy', 'policy_mismatch', 'excluded_tracked_file', 'unsupported_file', 'source_changed', 'source_busy', 'permission_denied', 'secret_detected', 'scan_limit', 'helper_upgrade_required'):
             return fail(args, code, detail)
         return fail(args, 'import_failed', text)
 

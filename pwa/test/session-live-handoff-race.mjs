@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 
 const { RELAY_PLAYWRIGHT_MODULE: modulePath, RELAY_E2E_URL: base, RELAY_E2E_ROOT_ID: rootId,
-  RELAY_E2E_VM: vm, RELAY_E2E_BROWSER_EXECUTABLE: executablePath, RELAY_REMOTE_CONTROLLER_STATE_DIR: state } = process.env;
+  RELAY_E2E_VM: vm, RELAY_E2E_BROWSER_EXECUTABLE: executablePath, RELAY_E2E_REMOTE_CONTROLLER_STATE_DIR: state } = process.env;
 if (!modulePath || !base || !rootId || !vm || !state || !state.startsWith('/') || process.env.RELAY_E2E_DISPOSABLE !== '1') {
   throw new Error('Set the Playwright module, candidate URL, disposable root ID, SSH alias, remote controller state, and RELAY_E2E_DISPOSABLE=1.');
 }
