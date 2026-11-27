@@ -111,6 +111,18 @@ repository on both endpoints for repeat handoffs.
 ./relay pull --workspace ID --into PATH --update --vm relay-do-v0 --json
 ```
 
+Plain batch pushes and Git handoffs stage a full replacement on the same
+filesystem and exchange it with the original as one directory operation.
+The previous tree is kept under `previous/` in the reported recovery directory.
+The destination needs space for both trees and a filesystem that supports atomic
+directory exchange. Pause external writers before transfer.
+
+For a pending plain batch or Git push, repeat the push command with `--inspect`
+to see the publication state, with `--resume` to finish, or with `--rollback`
+to restore the verified original before acknowledgment. Rollback retains the
+proposed tree if publication occurred. Reviewed merges still use their own
+resume command.
+
 A root `.relayignore` uses `protect PATTERN` and `exclude PATTERN`. Blank lines
 and lines starting with `#` are allowed. Patterns without a slash match any
 component. Patterns containing a slash start at the root. `*` and `?` match

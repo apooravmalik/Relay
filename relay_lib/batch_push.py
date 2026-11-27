@@ -18,12 +18,16 @@ from relay_lib.transfer_plan import build_plan
 def main(argv):
     parser = argparse.ArgumentParser(prog='relay push')
     parser.add_argument('--workspace', required=True); parser.add_argument('--project', required=True)
-    parser.add_argument('--vm', default='relay-v0'); parser.add_argument('--json', action='store_true'); parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--vm', default='relay-v0'); parser.add_argument('--json', action='store_true')
     parser.add_argument('--commit')
     parser.add_argument('--expect', metavar='PLAN_ID', help='reject changes since a Git dry run')
+    recovery = parser.add_mutually_exclusive_group()
+    recovery.add_argument('--resume', action='store_true')
+    recovery.add_argument('--inspect', action='store_true')
+    recovery.add_argument('--rollback', action='store_true')
     args = parser.parse_args(argv)
-    if (args.commit or args.expect) and args.resume:
-        parser.error('--resume uses the original preview and commit selection')
+    if (args.commit or args.expect) and (args.resume or args.inspect or args.rollback):
+        parser.error('Recovery uses the original preview and commit selection')
     try:
         dest = Path(args.project).expanduser().absolute()
         if dest.is_symlink() or not dest.is_dir() or dest.resolve() != dest: raise ValueError('Project must be an existing canonical directory.')
@@ -34,6 +38,8 @@ def main(argv):
             except BlockingIOError: raise ValueError('BUSY: another transfer holds the pairing lock.')
             if pairfile.with_suffix('.merge-pending.json').exists(): raise ValueError('RECOVERY_REQUIRED: a merge is pending.')
             if pairfile.with_suffix('.pending.json').exists(): raise ValueError('RECOVERY_REQUIRED: a pull is pending.')
+            if args.inspect or args.rollback:
+                return recover_push(args, dest, pending)
             if args.resume:
                 if not pending.exists():
                     receipt = json.loads(pairfile.with_suffix('.push-last.json').read_text())
@@ -84,6 +90,38 @@ def main(argv):
             return finish(op, pending, pairfile, args.json)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
         return imp.fail(args, 'push_failed', str(exc))
+
+
+def recover_push(args, destination, pending):
+    if not pending.is_file():
+        raise ValueError('There is no unfinished batch push for this destination.')
+    op = json.loads(pending.read_text())
+    if op['vm'] != args.vm or op['destination'] != str(destination):
+        raise ValueError('Pending push identity differs.')
+    if op.get('kind') == 'git' and op.get('direction') == 'push':
+        pair = op['base']
+        request = {'base': op['prior'], 'proposed': op['proposed']}
+        prefix = 'git'
+    elif op.get('kind') == 'batch':
+        pair = op['pair']
+        request = {'transfer_id': op['proposed']['transfer_id'], 'endpoint': upd.endpoint(pair),
+                   'base': op['base'], 'proposed': op['proposed']}
+        prefix = 'batch'
+    else:
+        raise ValueError('This recovery command requires a pending batch or Git push.')
+    if pair['workspace_id'] != args.workspace:
+        raise ValueError('Pending workspace identity differs.')
+    ssh, host = imp.ssh_command(args.vm)
+    action = 'inspect' if args.inspect else 'rollback'
+    result = imp.remote(ssh, host, args.workspace, prefix + '_' + action, request)
+    if args.rollback:
+        if result.get('status') != 'ABORTED' or result.get('transfer_id') != op['proposed']['transfer_id']:
+            raise ValueError('Rollback acknowledgment differs.')
+        archived = pending.with_suffix('.' + result['transfer_id'] + '.aborted.json')
+        os.replace(pending, archived)
+        upd.sync_directory(pending.parent)
+    print(json.dumps(result, ensure_ascii=True, indent=None if args.json else 2))
+    return 0
 
 
 def finish(op, pending, pairfile, as_json):

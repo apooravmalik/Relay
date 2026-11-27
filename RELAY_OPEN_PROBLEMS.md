@@ -140,16 +140,19 @@ the transfer protocol independent of npm so non-Node users are not excluded.
 
 ### RLY-015 · Multi-file publication is not atomic across the whole workspace
 
-**Status:** Open — recoverable, not atomically visible
+**Status:** Atomic publication implemented; release validation tracked separately
 
-A batch push journals and publishes files individually. A crash or concurrent
-reader may observe a partially updated tree until the transfer is resumed;
-prior versions are retained for recovery and a checkpoint is not acknowledged
-until verification. This is not a single atomic workspace transaction.
+Previously a multi-file push could expose a mix of old and new files. New plain
+batch pushes and Git publications build and verify a complete replacement before
+atomically exchanging it with the original. The original directory, including
+destination-local data, is retained. Managed VM reservations recognize both
+recorded directory identities until verification and acknowledgment complete.
 
-**Remaining work:** test interruption at every publication boundary, provide
-clear inspect/resume and safe rollback where possible, and prevent readers and
-writers from treating a partially published workspace as complete.
+For a pending push, use `relay push --workspace ID --project DIR --inspect`
+and `--resume` with the same options. `--rollback` restores a verified original
+before acknowledgment and retains the proposed tree if it was exchanged.
+Previously interrupted per-file journals retain their legacy resume path.
+Release and platform verification remain tracked under RLY-020 and RLY-023.
 
 ### RLY-016 · External writers cannot be reliably locked out
 

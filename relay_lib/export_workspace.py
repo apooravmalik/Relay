@@ -630,7 +630,7 @@ def guard_database(write=False):
             raise ValueError('Missing or invalid initialized store.')
         mode = 'rw' if write else 'ro'
         with closing(sqlite3.connect(database.resolve().as_uri() + '?mode=' + mode, uri=True, timeout=2)) as connection:
-            if connection.execute('PRAGMA user_version').fetchone()[0] != 2:
+            if connection.execute('PRAGMA user_version').fetchone()[0] != 3:
                 raise ValueError('Unsupported session schema.')
             if write:
                 connection.execute('PRAGMA synchronous=FULL')
@@ -673,10 +673,10 @@ def check_session_guards(connection, workspace_id, workspace_root):
 
 
 def check_handoff_guards(connection, workspace_id, workspace_root, transfer=None):
-    rows = connection.execute("""SELECT transfer_id, workspace_id, workspace_path, device, inode
+    rows = connection.execute("""SELECT transfer_id, workspace_id, workspace_path, device, inode, replacement_device, replacement_inode
         FROM handoff_guards WHERE state='ACTIVE'""")
-    for other_transfer, other_id, other_path, device, inode in rows:
-        if directory_identity(other_path) != (device, inode):
+    for other_transfer, other_id, other_path, device, inode, alternate_dev, alternate_ino in rows:
+        if directory_identity(other_path) not in ((device, inode), (alternate_dev, alternate_ino)):
             error('source_busy', 'A reserved handoff directory changed. Inspect recovery before continuing.')
         if other_transfer != transfer and (other_id == workspace_id or (workspace_root is not None and paths_overlap(str(workspace_root), other_path))):
             error('source_busy', 'This or an overlapping workspace has a pending handoff. Resume transfer ' + other_transfer + ' first.')
@@ -693,8 +693,8 @@ def reserve_handoff(connection, workspace_id, root, spec):
     row = connection.execute('SELECT * FROM handoff_guards WHERE transfer_id=?', (transfer,)).fetchone()
     device, inode = directory_identity(root)
     if row:
-        _, owner, saved_path, saved_device, saved_inode, saved_kind, saved_endpoint, saved_digest, state = row
-        if (owner, saved_path, saved_device, saved_inode, saved_endpoint) != (workspace_id, str(root), device, inode, endpoint):
+        _, owner, saved_path, saved_device, saved_inode, saved_kind, saved_endpoint, saved_digest, state, alternate_dev, alternate_ino = row
+        if (owner, saved_path, saved_endpoint) != (workspace_id, str(root), endpoint) or (device, inode) not in ((saved_device, saved_inode), (alternate_dev, alternate_ino)):
             error('checkpoint_mismatch', 'Transfer reservation identity differs.')
         if (saved_kind, saved_digest) != (kind, digest) and not (kind == 'pull_abort' and saved_kind in ('plain_pull', 'git_pull')):
             error('checkpoint_mismatch', 'Transfer reservation request differs.')
@@ -825,8 +825,8 @@ def batch_begin(root, workspace_id, request):
             if root.stat().st_dev != directory.parent.stat().st_dev: error('unsupported_file', 'Workspace and VM staging must be on the same filesystem.')
             if shutil.disk_usage(directory.parent).free < required + 1024 * 1024: error('insufficient_space', 'Insufficient VM disk space for staging.')
             directory.mkdir(mode=0o700, exist_ok=True)
-            prepare_slots(directory, operations)
-            state = {'identity':identity, 'operations':operations, 'phase':'uploading', 'cursor':0}
+            (directory / 'incoming').mkdir(mode=0o700, exist_ok=True)
+            state = {'identity':identity, 'operations':operations, 'phase':'uploading', 'publication_version':2}
             _push_write_json(state_path, state)
         return {'phase':state['phase'], 'upload_path':str(directory / 'incoming'), 'transfer_id':transfer}
 
@@ -869,7 +869,222 @@ def _batch_sync_dir(path):
     finally: os.close(fd)
 
 
+def _workspace_exchange(candidate, root):
+    # There is intentionally no sequence of ordinary renames as a fallback.
+    _batch_exchange(candidate, root)
+
+
+def _assert_exchange_paths(root, directory):
+    directory_identity(root)
+    directory_identity(directory)
+    if directory == root or root in directory.parents or directory in root.parents:
+        error('unsupported_file', 'Workspace and publication staging must be separate directories.')
+    if root.stat().st_dev != directory.stat().st_dev or root.parent.stat().st_dev != directory.stat().st_dev:
+        error('unsupported_file', 'Atomic workspace publication requires one filesystem.')
+    if sys.platform.startswith('linux'):
+        for line in Path('/proc/self/mountinfo').read_bytes().splitlines():
+            mount = re.sub(rb'\\([0-7]{3})', lambda match: bytes([int(match[1], 8)]), line.split()[4])
+            mounted = Path(os.fsdecode(mount))
+            if mounted == root or root in mounted.parents:
+                error('unsupported_file', 'Mounted workspaces and nested mounts cannot be exchanged safely.')
+    elif os.path.ismount(root):
+        error('unsupported_file', 'Mounted workspaces cannot be exchanged safely.')
+
+
+def _tree_fingerprint(root, *, sync=False):
+    """Account for the entire retained tree, including excluded files and .git."""
+    digest = hashlib.sha256()
+    device = root.stat().st_dev
+    links = {}
+
+    def visit(item):
+        info = item.lstat()
+        if info.st_dev != device:
+            error('unsupported_file', 'Nested filesystems cannot be copied for atomic publication.')
+        relative = item.relative_to(root).as_posix()
+        entry = [relative, info.st_mode, info.st_uid, info.st_gid]
+        if stat.S_ISREG(info.st_mode):
+            entry += [links.setdefault(info.st_ino, relative) if info.st_nlink > 1 else relative, sha(item)]
+            if sync:
+                with item.open('rb') as stream:
+                    os.fsync(stream.fileno())
+        elif stat.S_ISLNK(info.st_mode):
+            entry.append(os.readlink(item))
+        elif not stat.S_ISDIR(info.st_mode):
+            error('unsupported_file', 'Special files cannot be copied for atomic publication.')
+        if hasattr(os, 'listxattr'):
+            entry.append([(name, os.getxattr(item, name, follow_symlinks=False).hex())
+                          for name in sorted(os.listxattr(item, follow_symlinks=False))])
+        digest.update(json.dumps(entry, separators=(',', ':')).encode())
+        if stat.S_ISDIR(info.st_mode):
+            for child in sorted(item.iterdir()):
+                visit(child)
+            if sync:
+                _batch_sync_dir(item)
+
+    visit(root)
+    return digest.hexdigest()
+
+
+def _copy_workspace(root, candidate):
+    links = {}
+
+    def copy_file(source, destination):
+        info = os.stat(source, follow_symlinks=False)
+        identity = (info.st_dev, info.st_ino)
+        if info.st_nlink > 1 and identity in links:
+            os.link(links[identity], destination)
+            return destination
+        shutil.copy2(source, destination)
+        if info.st_nlink > 1:
+            links[identity] = destination
+        return destination
+
+    shutil.copytree(root, candidate, symlinks=True, copy_function=copy_file)
+
+
+def _verify_tree(root, snapshot):
+    meta, entries, _ = inspect(root)
+    if meta != snapshot['git'] or entries != snapshot['entries']:
+        error('recovery_required', 'Workspace does not match its recorded version; both copies are retained.')
+
+
+def _authorize_exchange(root, transfer, exchange):
+    if transfer is None:
+        return
+    with guard_database(write=True) as connection:
+        if connection is None:
+            return
+        original, replacement = exchange['original'], exchange['replacement']
+        row = connection.execute("""SELECT device, inode, replacement_device, replacement_inode
+            FROM handoff_guards WHERE transfer_id=? AND workspace_path=? AND state='ACTIVE'""",
+            (transfer, str(root))).fetchone()
+        if row is None or list(row[:2]) != original or list(row[2:]) not in ([None, None], replacement):
+            error('recovery_required', 'The active reservation cannot authorize this workspace exchange.')
+        connection.execute("""UPDATE handoff_guards SET replacement_device=?, replacement_inode=?
+            WHERE transfer_id=?""", (*replacement, transfer))
+
+
+def _exchange_side(root, candidate, record):
+    identities = [list(directory_identity(root)), list(directory_identity(candidate))]
+    if identities == [record['original'], record['replacement']]:
+        return 'original'
+    if identities == [record['replacement'], record['original']]:
+        return 'replacement'
+    error('recovery_required', 'Publication directory identities differ; both copies are retained.')
+
+
+def _check_exchange(root, candidate, record, side):
+    old, new = (root, candidate) if side == 'original' else (candidate, root)
+    if _tree_fingerprint(old) != record['original_digest'] or _tree_fingerprint(new) != record['replacement_digest']:
+        error('recovery_required', 'A workspace version changed; both copies are retained.')
+
+
+def _publish_tree(root, directory, state_path, state, base, proposed, build, *, transfer=None):
+    candidate = directory / 'previous'
+    if state['phase'] in ('rolling_back', 'aborted'):
+        error('recovery_required', 'This handoff is rolling back or was aborted. Inspect or finish rollback.')
+    _assert_exchange_paths(root, directory)
+    if 'exchange' not in state:
+        _verify_tree(root, base)
+        original = list(directory_identity(root))
+        digest = _tree_fingerprint(root)
+        # Before recording identities, only scratch data can exist at this path.
+        if candidate.exists():
+            shutil.rmtree(candidate)
+        _copy_workspace(root, candidate)
+        if _tree_fingerprint(candidate) != digest:
+            error('unsupported_file', 'Could not preserve the original workspace metadata and contents.')
+        build(candidate)
+        _verify_tree(candidate, proposed)
+        state['exchange'] = {
+            'original': original, 'original_digest': digest,
+            'replacement': list(directory_identity(candidate)), 'replacement_digest': _tree_fingerprint(candidate, sync=True),
+        }
+        state['phase'] = 'prepared'
+        _push_write_json(state_path, state)
+
+    record = state['exchange']
+    side = _exchange_side(root, candidate, record)
+    _check_exchange(root, candidate, record, side)
+    _authorize_exchange(root, transfer, record)
+    if side == 'original':
+        if state['phase'] != 'prepared':
+            error('recovery_required', 'The publication journal and workspace disagree.')
+        if transfer is not None:
+            _push_assert_idle(root)
+        _workspace_exchange(candidate, root)
+    _batch_sync_dir(root.parent)
+    _batch_sync_dir(directory)
+    if _exchange_side(root, candidate, record) != 'replacement':
+        error('recovery_required', 'Workspace exchange could not be verified.')
+    _check_exchange(root, candidate, record, 'replacement')
+    if state['phase'] != 'acknowledged':
+        state['phase'] = 'published'
+        _push_write_json(state_path, state)
+
+
+def _build_plain(candidate, directory, ops):
+    for op in ops:
+        target = candidate / op['path']
+        action = op['action']
+        if action in ('add', 'modify'):
+            if action == 'modify':
+                target.unlink()
+            shutil.copy2(directory / 'incoming' / op['path'], target)
+        elif action == 'delete':
+            target.unlink()
+        elif action == 'mkdir':
+            target.mkdir(mode=0o700)
+        elif action == 'rmdir':
+            target.rmdir()
+
+
 def batch_apply(root, workspace_id, request):
+    identity = _batch_identity(root, workspace_id, request)
+    transfer = identity['transfer_id']
+    directory = _batch_directory(transfer)
+    state_path = directory / 'journal.json'
+    state = json.loads(state_path.read_text())
+    if state['identity'] != identity:
+        error('checkpoint_mismatch', 'Transfer identity changed.')
+    if 'publication_version' not in state and state['phase'] in ('publishing', 'published', 'acknowledged'):
+        return _legacy_batch_apply(root, workspace_id, request)
+    base, proposed = identity['base'], identity['proposed']
+    endpoint = {'endpoint': identity['endpoint']}
+    with _batch_lock(workspace_id):
+        _push_assert_idle(root)
+        if state['phase'] == 'uploading':
+            verify_incoming(directory, state['operations'])
+            _verify_tree(root, base)
+            check_deletions(state['operations'], inspect(root)[2])
+            export = Path.home() / '.relay-v0' / 'exports' / transfer
+            export.mkdir(mode=0o700, exist_ok=True)
+            export_meta = {'workspace_id': workspace_id, 'source_path': str(root),
+                           'entries': proposed['entries'], 'git': proposed['git']}
+            manifest = export / 'manifest.json'
+            if manifest.exists() and json.loads(manifest.read_text()) != export_meta:
+                error('checkpoint_mismatch', 'Transfer manifest differs.')
+            _push_write_json(manifest, export_meta)
+            current = checkpoint(root, workspace_id, dict(endpoint, action='get'))
+            if current['checkpoint'] != base or current['pending'] not in (None, proposed):
+                error('checkpoint_mismatch', 'Remote checkpoint differs.')
+            checkpoint(root, workspace_id, dict(endpoint, action='prepare', checkpoint=proposed))
+            state.update(publication_version=2, phase='building')
+            _push_write_json(state_path, state)
+        elif 'exchange' not in state and state['phase'] == 'building':
+            verify_incoming(directory, state['operations'])
+        _publish_tree(root, directory, state_path, state, base, proposed,
+                      lambda candidate: _build_plain(candidate, directory, state['operations']), transfer=transfer)
+        current = checkpoint(root, workspace_id, dict(endpoint, action='commit', transfer_id=transfer))
+        if current != {'checkpoint': proposed, 'pending': None}:
+            error('recovery_required', 'Remote acknowledgment differs.')
+        state['phase'] = 'acknowledged'
+        _push_write_json(state_path, state)
+        return {'status': 'SUCCESS', 'transfer_id': transfer, 'recovery_path': str(directory), 'checkpoint': proposed}
+
+
+def _legacy_batch_apply(root, workspace_id, request):
     identity = _batch_identity(root, workspace_id, request)
     directory = _batch_directory(identity['transfer_id']); state_path = directory / 'journal.json'
     with _batch_lock(workspace_id):
@@ -1101,7 +1316,7 @@ def prepare_commit(root, directory, old, new):
     validate_history(root, new['head'], read_policy(root)[1], direct_git_directory(root))
 
 
-def publish_git(root, directory, base, proposed):
+def _publish_git_in_place(root, directory, base, proposed):
     state_path = directory / 'journal.json'
     if state_path.exists():
         state = json.loads(state_path.read_text())
@@ -1153,6 +1368,122 @@ def publish_git(root, directory, base, proposed):
     retain_git_snapshot(root, proposed)
 
 
+def publish_git(root, directory, base, proposed, *, transfer=None):
+    state_path = directory / 'journal.json'
+    if state_path.exists():
+        state = json.loads(state_path.read_text())
+        if state['base'] != base or state['proposed'] != proposed:
+            error('checkpoint_mismatch', 'Publication journal identity differs.')
+        if not state.get('publication_version'):
+            return _publish_git_in_place(root, directory, base, proposed)
+    else:
+        state = {'base': base, 'proposed': proposed, 'phase': 'building', 'publication_version': 2}
+        _push_write_json(state_path, state)
+
+    def build(candidate):
+        work = directory / 'private-build'
+        if work.exists():
+            shutil.rmtree(work)
+        work.mkdir(mode=0o700)
+        shutil.copytree(directory / 'incoming', work / 'incoming', symlinks=True)
+        blobs = directory / 'blobs'
+        if blobs.exists():
+            shutil.copytree(blobs, work / 'blobs', symlinks=True)
+        bundle = directory / 'history.bundle'
+        if os.path.lexists(bundle):
+            shutil.copy2(bundle, work / 'history.bundle', follow_symlinks=False)
+        _publish_git_in_place(candidate, work, base, proposed)
+        shutil.rmtree(work)
+
+    _publish_tree(root, directory, state_path, state, base, proposed, build, transfer=transfer)
+
+
+def inspect_push(root, workspace_id, request, *, git):
+    if git:
+        base, proposed = request['base'], request['proposed']
+        transfer = proposed['transfer_id']
+        endpoint = base['endpoint']
+        if (not re.fullmatch(r'[0-9a-f]{32}', transfer)
+                or any(item['workspace_id'] != workspace_id or item['source_path'] != str(root) or item['endpoint'] != endpoint
+                       for item in (base, proposed))):
+            error('checkpoint_mismatch', 'Git handoff identity differs.')
+    else:
+        identity = _batch_identity(root, workspace_id, request)
+        base, proposed, transfer, endpoint = (identity[key] for key in ('base', 'proposed', 'transfer_id', 'endpoint'))
+    # Inspection must not acquire a reservation or create a transfer directory.
+    directory = Path.home() / '.relay-v0' / 'batch-pushes' / transfer
+    journal = directory / 'journal.json'
+    current = checkpoint(root, workspace_id, {'action': 'get', 'endpoint': endpoint})
+    if current == {'checkpoint': proposed, 'pending': None}:
+        return {'status': 'acknowledged', 'transfer_id': transfer, 'rollback_available': False}
+    if current['checkpoint'] != base or current['pending'] not in (None, proposed):
+        error('checkpoint_mismatch', 'Remote checkpoint differs.')
+    status = 'uploading' if git and directory.is_dir() else 'not_started'
+    can_rollback = status == 'uploading'
+    if journal.is_file():
+        state = json.loads(journal.read_text())
+        if git:
+            if state['base'] != base or state['proposed'] != proposed:
+                error('checkpoint_mismatch', 'Publication journal identity differs.')
+        elif state['identity'] != identity:
+            error('checkpoint_mismatch', 'Publication journal identity differs.')
+        status = state['phase']
+        record = state.get('exchange')
+        if record:
+            side = _exchange_side(root, directory / 'previous', record)
+            status = {'original': 'prepared', 'replacement': 'published'}[side] if status not in ('rolling_back', 'aborted') else status
+        elif not state.get('publication_version') and status != 'uploading':
+            status = 'legacy_partial'
+        can_rollback = status not in ('legacy_partial', 'acknowledged', 'aborted')
+    return {'status': status, 'transfer_id': transfer, 'rollback_available': can_rollback,
+            'checkpoint_pending': current['pending'] is not None}
+
+
+def rollback_push(root, workspace_id, request, *, git):
+    # Reviewed merges may have published separately on the desktop.
+    if git and 'receiving' in request:
+        error('recovery_required', 'Resume reviewed merges through the merge command.')
+    status = inspect_push(root, workspace_id, request, git=git)
+    transfer = status['transfer_id']
+    base, proposed = request['base'], request['proposed']
+    endpoint = base['endpoint']
+    if status['status'] == 'not_started':
+        return {'status': 'ABORTED', 'transfer_id': transfer}
+    directory = _batch_directory(transfer)
+    state_path = directory / 'journal.json'
+    if status['status'] == 'aborted':
+        return {'status': 'ABORTED', 'transfer_id': transfer, 'recovery_path': str(directory)}
+    if not status['rollback_available']:
+        error('recovery_required', 'Rollback requires a verifiable publication before acknowledgment.')
+    with _batch_lock(workspace_id):
+        _push_assert_idle(root)
+        state = (json.loads(state_path.read_text()) if state_path.exists()
+                 else {'base': base, 'proposed': proposed, 'publication_version': 2})
+        record = state.get('exchange')
+        if record:
+            candidate = directory / 'previous'
+            _assert_exchange_paths(root, directory)
+            side = _exchange_side(root, candidate, record)
+            _check_exchange(root, candidate, record, side)
+            _authorize_exchange(root, transfer, record)
+            state['phase'] = 'rolling_back'
+            _push_write_json(state_path, state)
+            if side == 'replacement':
+                _workspace_exchange(candidate, root)
+            _batch_sync_dir(root.parent)
+            _batch_sync_dir(directory)
+            if _exchange_side(root, candidate, record) != 'original':
+                error('recovery_required', 'Workspace rollback could not be verified.')
+            _check_exchange(root, candidate, record, 'original')
+        _verify_tree(root, base)
+        current = checkpoint(root, workspace_id, {'action': 'abort', 'endpoint': endpoint, 'transfer_id': transfer})
+        if current != {'checkpoint': base, 'pending': None}:
+            error('recovery_required', 'The original checkpoint could not be verified.')
+        state['phase'] = 'aborted'
+        _push_write_json(state_path, state)
+        return {'status': 'ABORTED', 'transfer_id': transfer, 'recovery_path': str(directory)}
+
+
 def git_handoff_remote(root, workspace_id, action, request):
     base, proposed = request['base'], request['proposed']
     transfer, endpoint = proposed['transfer_id'], base['endpoint']
@@ -1186,9 +1517,19 @@ def git_handoff_remote(root, workspace_id, action, request):
                 export.mkdir(mode=0o700, exist_ok=True)
                 _push_write_json(export / 'manifest.json', proposed)
                 checkpoint(root, workspace_id, dict(identity, action='prepare', checkpoint=proposed))
-                publish_git(root, directory, receiving, proposed)
+                publish_git(root, directory, receiving, proposed, transfer=transfer)
                 return {'status': 'PUBLISHED', 'recovery_path': str(directory)}
         check_git_snapshot(root, proposed)
+        if action == 'git_ack_push' and not done:
+            state = json.loads((directory / 'journal.json').read_text())
+            if state.get('publication_version'):
+                if state['phase'] != 'published' or state['proposed'] != proposed:
+                    error('recovery_required', 'Verify the published Git tree before acknowledging it.')
+                candidate = directory / 'previous'
+                record = state['exchange']
+                if _exchange_side(root, candidate, record) != 'replacement':
+                    error('recovery_required', 'The Git workspace exchange could not be verified.')
+                _check_exchange(root, candidate, record, 'replacement')
         if not pushing:
             _push_assert_idle(root)
         if not done:
@@ -1230,7 +1571,7 @@ def handoff_spec(action, request):
         transfer = request.get('transfer_id') or request.get('checkpoint', {}).get('transfer_id', '')
         endpoint, digest, kind = request.get('endpoint', ''), '', kinds[phase]
         terminal = {'init': 'COMPLETED', 'commit': 'COMPLETED', 'abort': 'ABORTED', 'abort_import': 'ABORTED'}.get(phase)
-    elif action in ('git_begin', 'git_apply', 'git_ack_push', 'git_prepare_pull', 'git_ack_pull', 'batch_begin', 'batch_apply', 'push_one'):
+    elif action in ('git_begin', 'git_apply', 'git_ack_push', 'git_prepare_pull', 'git_ack_pull', 'batch_begin', 'batch_apply', 'push_one', 'git_rollback', 'batch_rollback'):
         transfer = request['proposed']['transfer_id']
         endpoint = request['base']['endpoint']
         if action.startswith('git_'):
@@ -1238,7 +1579,10 @@ def handoff_spec(action, request):
         else:
             kind = 'batch_push' if action.startswith('batch_') else 'file_push'
         digest = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-        terminal = 'COMPLETED' if action in ('git_ack_push', 'git_ack_pull', 'batch_apply', 'push_one') else None
+        if action in ('git_rollback', 'batch_rollback'):
+            terminal = 'ABORTED'
+        else:
+            terminal = 'COMPLETED' if action in ('git_ack_push', 'git_ack_pull', 'batch_apply', 'push_one') else None
     else:
         return None
     if not re.fullmatch(r'[0-9a-f]{32}', transfer) or not re.fullmatch(r'[0-9a-f]{64}', endpoint):
@@ -1250,9 +1594,13 @@ def replay_handoff(root, workspace_id, action, request, spec, state):
     transfer = spec.transfer
     current = checkpoint(root, workspace_id, {'action': 'get', 'endpoint': spec.endpoint})
     if state == 'ABORTED':
+        if action in ('git_rollback', 'batch_rollback'):
+            return {'status': 'ABORTED', 'transfer_id': transfer}
         if action == 'checkpoint' and request['action'] in ('abort', 'abort_import'):
             return current
         error('recovery_required', 'This transfer was aborted. Start a new transfer.')
+    if action in ('git_rollback', 'batch_rollback'):
+        error('recovery_required', 'An acknowledged publication cannot be rolled back.')
     proposed = current['checkpoint']
     if not proposed or proposed['transfer_id'] != transfer or current['pending'] is not None:
         error('checkpoint_mismatch', 'The completed transfer is no longer the current checkpoint.')
@@ -1280,7 +1628,9 @@ def dispatch_handoff(root, workspace_id, action, request):
         if reservation is not None and reservation[0] != 'ACTIVE':
             return replay_handoff(root, workspace_id, action, request, spec, reservation[0])
         try:
-            if action.startswith('git_'):
+            if action in ('git_rollback', 'batch_rollback'):
+                result = rollback_push(root, workspace_id, request, git=action == 'git_rollback')
+            elif action.startswith('git_'):
                 result = git_handoff_remote(root, workspace_id, action, request)
             elif action == 'checkpoint':
                 result = checkpoint(root, workspace_id, request)
@@ -1316,10 +1666,12 @@ def main():
             print(json.dumps({'schema_version': 1, 'workspaces': [{'id': hashlib.sha256(os.fsencode(str(root))).hexdigest()[:16], 'name': root.name} for root in workspace_roots()]}, ensure_ascii=True))
             return
         root = resolve_workspace(workspace_id)
-        if action in ('git_begin', 'git_apply', 'git_ack_push', 'git_prepare_pull', 'git_ack_pull', 'batch_begin', 'batch_apply', 'push_one', 'checkpoint'):
+        if action in ('git_begin', 'git_apply', 'git_ack_push', 'git_prepare_pull', 'git_ack_pull', 'batch_begin', 'batch_apply', 'push_one', 'checkpoint', 'git_rollback', 'batch_rollback'):
             request = json.load(sys.stdin)
             result = (checkpoint(root, workspace_id, request) if action == 'checkpoint' and request.get('action') == 'get'
                       else dispatch_handoff(root, workspace_id, action, request))
+        elif action in ('batch_inspect', 'git_inspect'):
+            result = inspect_push(root, workspace_id, json.load(sys.stdin), git=action == 'git_inspect')
         elif action == 'export_manifest':
             result = export_manifest(root, workspace_id, json.load(sys.stdin))
         elif action in ('preview', 'git_preview'):

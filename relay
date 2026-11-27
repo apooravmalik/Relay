@@ -8,7 +8,7 @@ Usage:
   relay doctor [--vm NAME]
   relay push --project DIR [--vm NAME]
   relay push --workspace WORKSPACE_ID --project DIR [--file RELATIVE_PATH] [--commit OID] --dry-run [--vm NAME] [--json]
-  relay push --workspace WORKSPACE_ID --project DIR [--file RELATIVE_PATH] [--commit OID] [--expect PLAN_ID] [--resume] [--vm NAME] [--json]
+  relay push --workspace WORKSPACE_ID --project DIR [--file RELATIVE_PATH] [--commit OID] [--expect PLAN_ID] [--resume | --inspect | --rollback] [--vm NAME] [--json]
   relay connect --project DIR [--vm NAME]
   relay merge --workspace WORKSPACE_ID --project DIR [--vm NAME] [--json]
   relay workspaces [--vm NAME] [--json]
