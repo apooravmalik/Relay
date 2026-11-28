@@ -3,15 +3,15 @@ import contextlib
 import io
 import json
 import os
-import resource
 import sqlite3
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
-from relay_lib import import_workspace, update_workspace
+from relay_lib import artifacts, import_workspace, update_workspace
 
 RELAY = Path(__file__).resolve().parents[1] / 'relay'
 
@@ -31,12 +31,23 @@ class ImportPreviewTests(unittest.TestCase):
         ssh.write_text('#!/bin/sh\nshift\nexec /bin/sh -c "$1"\n')
         ssh.chmod(0o755)
         rsync = self.bin / 'rsync'
-        rsync.write_text('#!/usr/bin/env python3\nimport os, sys, shlex, shutil, pathlib\nif os.environ.get("RELAY_TEST_INTERRUPT"): sys.exit(12)\nsrc = sys.argv[-2]\ndst = sys.argv[-1]\nif ":" in src: src = shlex.split(src.split(":", 1)[1])[0]\nif ":" in dst: dst = shlex.split(dst.split(":", 1)[1])[0]\nshutil.copytree(src, dst, dirs_exist_ok=True)\nif os.environ.get("RELAY_TEST_CORRUPT"):\n p = pathlib.Path(sys.argv[-1]) / "files" / "file"\n p.write_bytes(b"corrupt")\n')
+        rsync.write_text('#!/usr/bin/env python3\nimport os, sys, shlex, shutil, pathlib\nif os.environ.get("RELAY_TEST_INTERRUPT"): sys.exit(12)\nsrc = sys.argv[-2]\ndst = sys.argv[-1]\nif ":" in src: src = shlex.split(src.split(":", 1)[1])[0]\nif ":" in dst: dst = shlex.split(dst.split(":", 1)[1])[0]\nif os.path.isfile(src): shutil.copyfile(src, dst)\nelse: shutil.copytree(src, dst, dirs_exist_ok=True)\nif os.environ.get("RELAY_TEST_CORRUPT"):\n p = pathlib.Path(dst) if os.path.isfile(src) else pathlib.Path(dst) / "files" / "file"\n p.write_bytes(b"corrupt")\n')
         rsync.chmod(0o755)
         registry = self.base / 'registry.json'
         registry.write_text(json.dumps({'roots': [str(self.source)]}))
         self.env = {**os.environ, 'HOME': str(self.base), 'PATH': str(self.bin) + os.pathsep + os.environ['PATH'], 'RELAY_WORKSPACE_REGISTRY_FILE': str(registry)}
         self.workspace_id = hashlib.sha256(os.fsencode(str(self.source))).hexdigest()[:16]
+
+    @contextlib.contextmanager
+    def open_recovery(self, value):
+        """Read recovery artifacts through the authenticated decryption path."""
+        path = Path(value)
+        if path.suffix != '.age':
+            yield path
+            return
+        with tempfile.TemporaryDirectory(prefix='relay-test-recovery-') as temporary:
+            store = artifacts.ArtifactStore(path.parent.parent)
+            yield artifacts.decrypt_archive(path, store, Path(temporary))
 
     def run_relay(self, *args):
         return subprocess.run([str(RELAY), 'pull', *args], env=self.env, capture_output=True, text=True)
@@ -145,7 +156,8 @@ class ImportPreviewTests(unittest.TestCase):
         self.assertNotIn('TOKEN=secret', pushed.stdout + pushed.stderr)
         self.assertEqual((self.source / 'file').read_text(), 'local feature')
         self.assertEqual((self.source / '.env').read_text(), 'TOKEN=secret')
-        self.assertEqual(Path(json.loads(pushed.stdout)['remote_recovery_path']).read_text(), 'old')
+        with self.open_recovery(json.loads(pushed.stdout)['remote_recovery_path']) as recovery:
+            self.assertEqual(recovery.read_text(), 'old')
         (self.source / 'file').write_text('cloud feature')
         pull = self.run_relay('--workspace', self.workspace_id, '--into', str(project), '--update', '--json')
         self.assertEqual(pull.returncode, 0, pull.stdout + pull.stderr)
@@ -253,7 +265,8 @@ class ImportPreviewTests(unittest.TestCase):
         resumed = subprocess.run(command, env=self.env, capture_output=True, text=True)
         self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
         recovery = Path(json.loads(resumed.stdout)['remote_recovery_path'])
-        self.assertEqual((recovery / 'previous' / 'one').read_text(), 'old one')
+        with self.open_recovery(recovery) as retained:
+            self.assertEqual((retained / 'one').read_text(), 'old one')
         self.assertEqual((self.source / 'one').read_text(), 'new one')
         self.assertEqual((self.source / 'two').read_text(), 'new two')
 
@@ -297,9 +310,9 @@ class ImportPreviewTests(unittest.TestCase):
         self.assertEqual(json.loads(inspect.stdout)['status'], 'published')
         result = subprocess.run([str(RELAY), 'push', *args, '--rollback'], env=self.env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        previous = Path(json.loads(result.stdout)['recovery_path']) / 'previous'
-        self.assertEqual((previous / 'one').read_text(), 'new one')
-        self.assertFalse((previous / 'two').exists())
+        with self.open_recovery(json.loads(result.stdout)['recovery_path']) as rollback_copy:
+            self.assertEqual((rollback_copy / 'one').read_text(), 'new one')
+            self.assertFalse((rollback_copy / 'two').exists())
         self.assertEqual((self.source / 'one').read_text(), 'old one')
         self.assertEqual((self.source / 'two').read_text(), 'old two')
         self.assertEqual(dependency.read_text(), 'VM runtime')
@@ -350,7 +363,8 @@ class ImportPreviewTests(unittest.TestCase):
                 else:
                     self.assertFalse((source / 'existing').exists())
                     recovery = Path(json.loads(resumed.stdout)['remote_recovery_path'])
-                    self.assertEqual((recovery / 'previous' / 'existing').read_text(), 'old')
+                    with self.open_recovery(recovery) as retained:
+                        self.assertEqual((retained / 'existing').read_text(), 'old')
 
     def test_multifile_push_recovers_lost_final_acknowledgment(self):
         from relay_lib import batch_push
@@ -435,7 +449,8 @@ class ImportPreviewTests(unittest.TestCase):
         resumed = self.run_push(project, 'file', '--resume')
         self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
         self.assertEqual((self.source / 'file').read_text(), 'local')
-        self.assertEqual(Path(json.loads(resumed.stdout)['remote_recovery_path']).read_text(), 'old')
+        with self.open_recovery(json.loads(resumed.stdout)['remote_recovery_path']) as recovery:
+            self.assertEqual(recovery.read_text(), 'old')
 
     def test_remote_git_subdirectory_is_still_rejected(self):
         subprocess.run(['git', 'init', '-q', str(self.base)], check=True)
@@ -467,7 +482,8 @@ class ImportPreviewTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((project / 'file').read_text(), 'remote change')
         self.assertEqual((project / '__pycache__' / 'local.pyc').read_bytes(), b'local cache')
-        self.assertEqual((Path(json.loads(result.stdout)['recovery_path']) / '__pycache__' / 'local.pyc').read_bytes(), b'local cache')
+        with self.open_recovery(json.loads(result.stdout)['recovery_path']) as retained:
+            self.assertEqual((retained / '__pycache__' / 'local.pyc').read_bytes(), b'local cache')
         receipt = self.run_relay('--resume-update', str(project), '--json')
         self.assertEqual(receipt.returncode, 0, receipt.stdout + receipt.stderr)
         self.assertEqual(json.loads(receipt.stdout)['checkpoint_id'], json.loads(result.stdout)['checkpoint_id'])
@@ -503,7 +519,8 @@ class ImportPreviewTests(unittest.TestCase):
         receipt = json.loads(update.stdout)
         self.assertEqual((project / '.env').read_text(), 'TOKEN=second')
         self.assertFalse((project / 'old').exists())
-        self.assertEqual((Path(receipt['recovery_path']) / '.env').read_text(), 'TOKEN=first')
+        with self.open_recovery(receipt['recovery_path']) as retained:
+            self.assertEqual((retained / '.env').read_text(), 'TOKEN=first')
         (project / '.env').write_text('TOKEN=local')
         (self.source / '.env').write_text('TOKEN=cloud')
         conflict = self.run_relay(*args, '--dry-run')
@@ -551,7 +568,8 @@ class ImportPreviewTests(unittest.TestCase):
         resumed = self.run_relay('--resume-update', str(project), '--json')
         self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
         self.assertEqual((project / 'file').read_text(), 'second')
-        self.assertEqual((Path(json.loads(resumed.stdout)['recovery_path']) / 'file').read_text(), 'first')
+        with self.open_recovery(json.loads(resumed.stdout)['recovery_path']) as retained:
+            self.assertEqual((retained / 'file').read_text(), 'first')
 
     def test_inspect_reports_missing_and_corrupt_downloads_without_values(self):
         (self.source / '.env').write_text('TOKEN=old')
@@ -622,7 +640,8 @@ class ImportPreviewTests(unittest.TestCase):
         resumed = self.run_relay('--resume-update', str(project), '--json')
         self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
         self.assertEqual((project / 'file').read_text(), 'second')
-        self.assertEqual((Path(json.loads(resumed.stdout)['recovery_path']) / 'file').read_text(), 'first')
+        with self.open_recovery(json.loads(resumed.stdout)['recovery_path']) as retained:
+            self.assertEqual((retained / 'file').read_text(), 'first')
 
     def test_abort_interrupted_download_leaves_original_and_remote_base(self):
         self.enable_managed_handoffs()
@@ -745,12 +764,13 @@ class ImportPreviewTests(unittest.TestCase):
         self.assertEqual((self.source / 'two').read_text(), 'working two')
         result = subprocess.run([str(RELAY), 'push', *args, '--resume'], env=self.env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        retained = Path(json.loads(result.stdout)['remote_recovery_path']) / 'previous'
-        self.assertEqual(head_and_index(retained), expected_original)
-        self.assertEqual((retained / 'one').read_text(), 'old one')
-        self.assertEqual((retained / 'two').read_text(), 'old two')
-        (self.source / 'one').write_text('later edit')
-        self.assertEqual((retained / 'one').read_text(), 'old one')
+        with self.open_recovery(json.loads(result.stdout)['remote_recovery_path']) as payload:
+            retained = payload
+            self.assertEqual(head_and_index(retained), expected_original)
+            self.assertEqual((retained / 'one').read_text(), 'old one')
+            self.assertEqual((retained / 'two').read_text(), 'old two')
+            (self.source / 'one').write_text('later edit')
+            self.assertEqual((retained / 'one').read_text(), 'old one')
 
     def test_git_round_trips_policy_and_existing_commit(self):
         self.enable_managed_handoffs()
@@ -1022,10 +1042,26 @@ class ImportPreviewTests(unittest.TestCase):
         with (self.source / 'database.bin').open('wb') as file:
             file.truncate(80 * 1024 * 1024)
         subprocess.run(['git', '-C', str(self.source), 'add', 'database.bin'], check=True)
-        def limit_memory():
-            resource.setrlimit(resource.RLIMIT_AS, (96 * 1024 * 1024, 96 * 1024 * 1024))
-        result = subprocess.run([str(RELAY), 'pull', '--workspace', self.workspace_id, '--into', str(self.dest), '--json'], env=self.env, capture_output=True, text=True, preexec_fn=limit_memory)
-        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        # Go-based age reserves a large virtual address range and cannot run
+        # under RLIMIT_AS. Measure the Relay Python process itself while the
+        # 80 MiB Git blob is streamed through the real encrypted import path.
+        command = [str(RELAY), 'pull', '--workspace', self.workspace_id, '--into', str(self.dest), '--json']
+        process = subprocess.Popen(command, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        peak_kib = 0
+        status = Path('/proc') / str(process.pid) / 'status'
+        while process.poll() is None:
+            try:
+                for line in status.read_text().splitlines():
+                    if line.startswith('VmRSS:'):
+                        peak_kib = max(peak_kib, int(line.split()[1]))
+                        break
+            except FileNotFoundError:
+                pass
+            time.sleep(0.002)
+        stdout, stderr = process.communicate()
+        self.assertEqual(process.returncode, 0, stderr + stdout)
+        self.assertGreater(peak_kib, 0, 'Relay process memory was not sampled')
+        self.assertLess(peak_kib, 96 * 1024, f'Relay process RSS grew to {peak_kib} KiB')
         self.assertEqual((self.dest / 'source' / 'database.bin').stat().st_size, 80 * 1024 * 1024)
 
     def test_lfs_pointer_is_rejected(self):

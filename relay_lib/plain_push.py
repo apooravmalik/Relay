@@ -121,7 +121,7 @@ def finish(op, pending, pairfile, as_json):
     next_pair = dict(pair, acknowledgment='acknowledged', generation=proposed['generation'], parent_id=pair['checkpoint_id'], checkpoint_id=proposed['transfer_id'], entries=proposed['entries'], git=proposed['git'], remote_recovery_path=result['recovery_path'])
     imp.write_json_atomic(pairfile, next_pair)
     pending.unlink()
-    print(json.dumps({'status':'SUCCESS', 'transfer_id':proposed['transfer_id'], 'path':op['path'], 'remote_recovery_path':result['recovery_path']}, ensure_ascii=True, indent=None if as_json else 2))
+    print(json.dumps({'status':'SUCCESS', 'transfer_id':proposed['transfer_id'], 'path':op['path'], 'remote_recovery_path':result['recovery_path'], 'recovery_artifact':result.get('recovery_artifact')}, ensure_ascii=True, indent=None if as_json else 2))
     return 0
 
 

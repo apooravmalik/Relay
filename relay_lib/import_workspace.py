@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Import an exported VM workspace into a new local directory."""
 import argparse
+import base64
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -13,12 +14,24 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
+import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from relay_lib.publication import publish_noreplace
-from relay_lib import export_workspace, update_workspace
+from relay_lib import artifacts, export_workspace, update_workspace
 
-HELPER = (Path(__file__).resolve().parent / 'export_workspace.py').read_text()
+def embedded_helper():
+    def encoded(name):
+        source = Path(__file__).resolve().with_name(name).read_bytes()
+        return base64.b64encode(zlib.compress(source)).decode('ascii')
+
+    return ('import base64, sys, types, zlib; '
+            'module=types.ModuleType("artifacts"); sys.modules["artifacts"]=module; '
+            f'exec(zlib.decompress(base64.b64decode({encoded("artifacts.py")!r})), module.__dict__); '
+            f'exec(zlib.decompress(base64.b64decode({encoded("export_workspace.py")!r})))')
+
+
+HELPER = embedded_helper()
 
 
 def fail(args, code, message):
@@ -40,7 +53,7 @@ def ssh_command(vm):
     return ssh, host
 
 
-def remote(ssh, host, workspace, action, request=None):
+def remote_command(workspace, action):
     arguments = ' ' + shlex.quote(workspace) + ' ' + shlex.quote(action)
     command = 'python3 -c ' + shlex.quote(HELPER) + arguments
     # A non-default controller must use the same guard database and registry as
@@ -69,11 +82,51 @@ def remote(ssh, host, workspace, action, request=None):
     elif not installed:
         command = ('if test -x "$HOME/.relay-v0/bin/relay-handoff"; then exec "$HOME/.relay-v0/bin/relay-handoff"'
                    + arguments + '; else ' + command + '; fi')
+    return command
+
+
+def remote(ssh, host, workspace, action, request=None):
+    if action in ('capture', 'git_capture'):
+        request = dict(request or {}, recipient=artifacts.ArtifactStore().recipient())
+    command = remote_command(workspace, action)
     result = subprocess.run([*ssh, host, command], stdout=subprocess.PIPE, stderr=subprocess.PIPE, input=json.dumps(request).encode() if request is not None else None)
     try: data = json.loads(result.stdout)
     except ValueError: raise ValueError('Could not obtain a response over SSH; check connectivity and remote Python and Git.')
     if result.returncode or 'error' in data: raise ValueError(data.get('error', 'remote_error') + ': ' + data.get('message', 'Remote operation failed.'))
     return data
+
+
+def download_export(ssh, host, state, stage, message):
+    manifest = state['manifest']
+    # Read the authoritative path at resume as well as at initial download.
+    saved = remote(ssh, host, manifest['workspace_id'], 'export_manifest',
+                   {'transfer_id': manifest['transfer_id']})
+    if saved['manifest'] != manifest:
+        raise ValueError('Snapshot manifest changed during transfer.')
+    payload = stage / 'payload'
+    archive = saved.get('archive_path')
+    if archive:
+        source = host + ':' + shlex.quote(archive)
+        partial = stage / 'snapshot.age'
+        destination = str(partial)
+    else:
+        source = host + ':' + shlex.quote(saved['export_path'].rstrip('/') + '/')
+        payload.mkdir(mode=0o700, exist_ok=True)
+        destination = str(payload) + '/'
+    shell = ' '.join(shlex.quote(word) for word in ssh)
+    result = subprocess.run(['rsync', '-r', '--checksum', '--partial', '-e', shell, '--', source, destination])
+    if result.returncode:
+        raise ValueError(message)
+    if archive:
+        partial.chmod(0o600)
+        with tempfile.TemporaryDirectory(prefix='.decrypt-', dir=stage) as directory:
+            extracted = artifacts.decrypt_archive(partial, artifacts.ArtifactStore(), Path(directory))
+            if payload.exists():
+                shutil.rmtree(payload)
+            os.replace(extracted, payload)
+    if (payload / 'manifest.json').is_symlink() or json.loads((payload / 'manifest.json').read_text()) != manifest:
+        raise ValueError('Snapshot manifest changed during transfer.')
+    return payload
 
 
 def safe_path(value):
@@ -258,15 +311,9 @@ def _finish_transfer(args, state, state_file):
         return complete_transfer(args, state, state_file)
     pair = update_workspace.initial_pair(state, write_json_atomic)
     update_workspace.remote_cp(sys.modules[__name__], args.vm, pair, 'begin_import', update_workspace.cp(pair))
-    payload = staging / 'payload'
-    payload.mkdir(exist_ok=True)
     print('relay: transferring snapshot ' + transfer, file=sys.stderr)
-    shell = ' '.join(shlex.quote(x) for x in ssh)
-    source = host + ':' + shlex.quote(state['export_path'].rstrip('/') + '/')
-    result = subprocess.run(['rsync', '-r', '--checksum', '--partial', '-e', shell, '--', source, str(payload) + '/'])
-    if result.returncode: raise ValueError('Transfer interrupted. Resume with --resume ' + transfer + ' --vm ' + args.vm)
-    disk_manifest = json.loads((payload / 'manifest.json').read_text())
-    if disk_manifest != manifest: raise ValueError('Snapshot manifest changed during transfer.')
+    payload = download_export(ssh, host, state, staging,
+                              'Transfer interrupted. Resume with --resume ' + transfer + ' --vm ' + args.vm)
     verify_payload(payload, manifest)
     project = staging / 'project'
     if project.exists(): shutil.rmtree(project)

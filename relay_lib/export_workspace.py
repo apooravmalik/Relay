@@ -1,4 +1,5 @@
 """VM-side workspace capture, handoff, and recovery operations."""
+import atexit
 import hashlib
 import sqlite3
 from contextlib import closing, contextmanager, nullcontext
@@ -19,6 +20,11 @@ import tempfile
 import time
 from typing import NamedTuple, Optional
 import uuid
+
+if __package__:
+    from . import artifacts
+else:
+    import artifacts
 
 
 def error(code, message):
@@ -247,22 +253,47 @@ def inspect(root, allow_parent_git=False):
     return meta, entries, sorted(exclusions)
 
 
+_content_scratch = None
+
+
 def content_store():
-    folder = Path.home() / '.relay-v0' / 'git-content'
-    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return folder
+    global _content_scratch
+    if _content_scratch is None:
+        _content_scratch = tempfile.TemporaryDirectory(prefix='relay-content-')
+        atexit.register(_content_scratch.cleanup)
+    return Path(_content_scratch.name)
+
+
+def content_id(key):
+    return 'content-' + hashlib.sha256(key.encode('ascii')).hexdigest()
+
+
+def store_content(key, source):
+    return artifacts.ArtifactStore().seal(content_id(key), source, witness=key)
+
+
+def load_content(key, target):
+    store = artifacts.ArtifactStore()
+    with store.locked(shared=True):
+        archive, _ = store._get(content_id(key), None)
+        with tempfile.TemporaryDirectory(dir=target.parent) as scratch:
+            path = artifacts.decrypt_archive(archive, store, Path(scratch))
+            os.replace(path, target)
 
 
 def retain_git_snapshot(root, snapshot, payload=None):
-    """Keep private baseline versions addressed by their content."""
-    store = content_store()
+    """Keep encrypted baseline versions addressed by their content."""
+    store = artifacts.ArtifactStore()
     wanted = [('file-' + item['sha256'], item['path']) for item in snapshot['entries'] if item['type'] == 'file']
     wanted += [('blob-' + item['oid'], None) for item in snapshot['git']['index']]
     for key, relative in wanted:
-        target = store / key
-        if target.exists():
+        try:
+            store.get(content_id(key))
             continue
-        with tempfile.NamedTemporaryFile(dir=store) as out:
+        except artifacts.ArtifactError as exc:
+            if not str(exc).startswith(('artifact_missing:', 'artifact_expired:')):
+                raise
+        with tempfile.NamedTemporaryFile(dir=content_store()) as out:
             if relative is not None:
                 path = (payload / 'files' if payload else root) / relative
                 with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as stream:
@@ -279,12 +310,7 @@ def retain_git_snapshot(root, snapshot, payload=None):
                 out.seek(0)
                 if run_git(root, 'hash-object', '--stdin', stdin=out).stdout.decode().strip() != key[5:]:
                     error('source_changed', 'Git blob changed while storing the checkpoint.')
-            os.fsync(out.fileno())
-            try:
-                os.link(out.name, target)
-            except FileExistsError:
-                pass
-    _batch_sync_dir(store)
+            store_content(key, Path(out.name))
 
 
 def make_history_bundle(root, meta, target, policy_root=None):
@@ -322,15 +348,15 @@ def _capture_roots(root):
     return roots
 
 
-def capture(root, workspace_id, include_history=True, against=None):
+def capture(root, workspace_id, include_history=True, against=None, recipient=None):
     roots = _capture_roots(root)
     with WriterFence(*roots) as fence:
         if _capture_roots(root) != roots:
             error('writer_unverified', 'The Git storage changed while establishing the writer fence.')
-        return _capture_fenced(root, workspace_id, include_history, against, fence)
+        return _capture_fenced(root, workspace_id, include_history, against, fence, recipient)
 
 
-def _capture_fenced(root, workspace_id, include_history, against, fence):
+def _capture_fenced(root, workspace_id, include_history, against, fence, recipient):
     export_root = Path.home() / '.relay-v0' / 'exports'
     export_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(export_root, 0o700)
@@ -342,8 +368,8 @@ def _capture_fenced(root, workspace_id, include_history, against, fence):
         error('source_busy', 'Another capture is already in progress for this workspace.')
     before = inspect(root)
     transfer = uuid.uuid4().hex
-    target = export_root / transfer
-    target.mkdir(mode=0o700)
+    metadata = export_root / transfer
+    target = Path(tempfile.mkdtemp(prefix='.capture-', dir=export_root))
     try:
         previous = {item['path']: item for item in against['entries']} if against else {}
         known = {item['oid'] for item in against['git']['index']} if against else set()
@@ -381,16 +407,17 @@ def _capture_fenced(root, workspace_id, include_history, against, fence):
         manifest = {'schema_version': 1, 'transfer_id': transfer, 'workspace_id': workspace_id, 'source_path': str(root), 'name': root.name, 'created_at': int(time.time()), 'git': meta, 'entries': before[1], 'exclusions': before[2], 'payload': payload, 'consistency': 'independent writers must be paused during capture'}
         if against is not None:
             manifest['delta_from'] = against['transfer_id']
-        if meta['mode'] != 'plain':
-            retain_git_snapshot(root, manifest, target if against is None else None)
         fence.check()
-        (target / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=True, sort_keys=True, separators=(',', ':')))
+        raw = json.dumps(manifest, ensure_ascii=True, sort_keys=True, separators=(',', ':'))
+        (target / 'manifest.json').write_text(raw)
+        artifacts.ArtifactStore().seal('export-' + transfer, target, workspace=workspace_id,
+                                       recipient=recipient, witness=hashlib.sha256(raw.encode()).hexdigest())
         fence.check()
-        return manifest, str(target)
-    except BaseException:
-        shutil.rmtree(target, ignore_errors=True)
-        raise
+        metadata.mkdir(mode=0o700)
+        (metadata / 'manifest.json').write_text(raw)
+        return manifest, str(metadata)
     finally:
+        shutil.rmtree(target, ignore_errors=True)
         lock.close()
 
 
@@ -490,7 +517,17 @@ def export_manifest(root, workspace_id, request):
     raw = path.read_bytes()
     manifest = json.loads(raw)
     if manifest['workspace_id'] != workspace_id or manifest['source_path'] != str(root): error('checkpoint_mismatch', 'Original export identity differs.')
-    return {'manifest': manifest, 'sha256': hashlib.sha256(raw).hexdigest(), 'export_path': str(path.parent)}
+    result = {'manifest': manifest, 'sha256': hashlib.sha256(raw).hexdigest(), 'export_path': str(path.parent)}
+    store = artifacts.ArtifactStore()
+    if not (path.parent / 'files').is_dir():
+        result['archive_path'] = str(store.get('export-' + transfer, workspace_id))
+    elif time.time() - manifest['created_at'] >= store.ttl:
+        with guard_database() as connection:
+            pending = connection is not None and connection.execute(
+                "SELECT 1 FROM handoff_guards WHERE transfer_id=? AND state='ACTIVE'", (transfer,)).fetchone()
+        if not pending:
+            error('artifact_expired', 'The legacy export expired. Start a fresh capture.')
+    return result
 
 
 class WriterFence:
@@ -702,6 +739,12 @@ def push_one(root, workspace_id, request):
             checkpoint(root, workspace_id, {'action':'prepare', 'endpoint':endpoint, 'checkpoint':proposed})
         elif not ((current['checkpoint'] == base and current['pending'] == proposed) or (current['checkpoint'] == proposed and current['pending'] is None)):
             error('checkpoint_mismatch', 'Remote checkpoint cannot be reconciled.')
+        if state['phase'] == 'acknowledged' and state.get('recovery_artifact'):
+            _verify_tree(root, proposed)
+            retained = finish_recovery(state['recovery_artifact'], workspace_id, candidate)
+            return {'status': 'SUCCESS', 'transfer_id': transfer, 'checkpoint': proposed, **retained}
+        artifact_id = 'vm-' + transfer
+        group = 'vm:' + str(root)
         if state['phase'] in ('prepared', 'publishing'):
             def matches(path, entry):
                 try:
@@ -712,6 +755,7 @@ def push_one(root, workspace_id, request):
                 if meta != base['git'] or entries != base['entries']: error('conflict', 'VM workspace changed during preparation.')
                 if any((root.joinpath(*relative.split('/')[:n])).is_symlink() for n in range(1, len(relative.split('/')) + 1)): error('unsupported_file', 'Symlink encountered.')
                 _push_assert_idle(root)
+                state['recovery_artifact'] = seal_recovery(artifact_id, target, workspace_id, group, old[relative]['sha256'])
                 state['phase'] = 'publishing'; _push_write_json(state_path, state)
                 libc = ctypes.CDLL(None, use_errno=True)
                 fn = getattr(libc, 'renameat2', None)
@@ -730,10 +774,14 @@ def push_one(root, workspace_id, request):
                 meta, entries, _ = inspect(root)
                 if meta != proposed['git'] or entries != proposed['entries'] or not _batch_matches(candidate, old[relative]):
                     error('recovery_required', 'Workspace or recovery copy changed after publication.')
+                if not state.get('recovery_artifact'):
+                    state['recovery_artifact'] = seal_recovery(artifact_id, candidate, workspace_id, group, old[relative]['sha256'])
+                    _push_write_json(state_path, state)
                 current = checkpoint(root, workspace_id, {'action':'commit', 'endpoint':endpoint, 'transfer_id':transfer})
             if current['checkpoint'] != proposed or current['pending'] is not None: error('recovery_required', 'Remote acknowledgment differs.')
             state['phase'] = 'acknowledged'; _push_write_json(state_path, state)
-            return {'status':'SUCCESS', 'transfer_id':transfer, 'recovery_path':str(candidate), 'checkpoint':current['checkpoint']}
+            retained = finish_recovery(state['recovery_artifact'], workspace_id, candidate)
+            return {'status': 'SUCCESS', 'transfer_id': transfer, 'checkpoint': current['checkpoint'], **retained}
         error('recovery_required', 'Unknown transfer phase.')
 
 
@@ -1170,7 +1218,33 @@ def _check_exchange(root, candidate, record, side):
         error('recovery_required', 'A workspace version changed; both copies are retained.')
 
 
-def _publish_tree(root, directory, state_path, state, base, proposed, build, *, transfer=None, finish=None):
+def seal_recovery(artifact_id, source, workspace, group, witness):
+    store = artifacts.ArtifactStore()
+    store.seal(artifact_id, source, workspace=workspace, group=group, witness=witness, pending=True)
+    return artifact_id
+
+
+def finish_recovery(artifact_id, workspace, *scratch):
+    store = artifacts.ArtifactStore()
+    archive = store.get(artifact_id, workspace)
+    store.mark(artifact_id, pending=False)
+    for path in scratch:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+    return {'recovery_artifact': artifact_id, 'recovery_path': str(archive)}
+
+
+def vm_recovery(root, transfer, workspace_id):
+    return 'vm-' + transfer, workspace_id, 'vm:' + str(root)
+
+
+def pc_recovery(root, transfer):
+    return 'pc-' + transfer, None, 'pc:' + str(root)
+
+
+def _publish_tree(root, directory, state_path, state, base, proposed, build, *, transfer=None, finish=None, recovery=None):
     candidate = directory / 'previous'
     if state['phase'] in ('rolling_back', 'aborted'):
         error('recovery_required', 'This handoff is rolling back or was aborted. Inspect or finish rollback.')
@@ -1204,11 +1278,21 @@ def _publish_tree(root, directory, state_path, state, base, proposed, build, *, 
         if side == 'original':
             if state['phase'] != 'prepared':
                 error('recovery_required', 'The publication journal and workspace disagree.')
+            if recovery:
+                artifact_id, workspace, group = recovery
+                state['recovery_artifact'] = seal_recovery(artifact_id, root, workspace, group, record['original_digest'])
+                _push_write_json(state_path, state)
+                _check_exchange(root, candidate, record, side)
             if fence is not None:
                 fence.check()
             _workspace_exchange(candidate, root)
             if fence is not None:
                 fence.check(exchanged=True)
+        if recovery and not state.get('recovery_artifact'):
+            # Resume an exchange written by an earlier helper after verifying the previous tree.
+            artifact_id, workspace, group = recovery
+            state['recovery_artifact'] = seal_recovery(artifact_id, candidate, workspace, group, record['original_digest'])
+            _push_write_json(state_path, state)
         _batch_sync_dir(root.parent)
         _batch_sync_dir(directory)
         if _exchange_side(root, candidate, record) != 'replacement':
@@ -1252,6 +1336,12 @@ def batch_apply(root, workspace_id, request):
     base, proposed = identity['base'], identity['proposed']
     endpoint = {'endpoint': identity['endpoint']}
     with _batch_lock(workspace_id):
+        if state['phase'] == 'acknowledged' and state.get('recovery_artifact'):
+            if checkpoint(root, workspace_id, dict(endpoint, action='get')) != {'checkpoint': proposed, 'pending': None}:
+                error('recovery_required', 'Remote acknowledgment differs.')
+            _verify_tree(root, proposed)
+            retained = finish_recovery(state['recovery_artifact'], workspace_id, directory / 'previous', directory / 'incoming')
+            return {'status': 'SUCCESS', 'transfer_id': transfer, 'checkpoint': proposed, **retained}
         _push_assert_idle(root)
         if state['phase'] == 'uploading':
             verify_incoming(directory, state['operations'])
@@ -1280,11 +1370,14 @@ def batch_apply(root, workspace_id, request):
                 error('recovery_required', 'Remote acknowledgment differs.')
             state['phase'] = 'acknowledged'
             _push_write_json(state_path, state)
-            return {'status': 'SUCCESS', 'transfer_id': transfer, 'recovery_path': str(directory), 'checkpoint': proposed}
+            return {'status': 'SUCCESS', 'transfer_id': transfer, 'checkpoint': proposed}
 
-        return _publish_tree(root, directory, state_path, state, base, proposed,
-                             lambda candidate: _build_plain(candidate, directory, state['operations']),
-                             transfer=transfer, finish=acknowledge)
+        result = _publish_tree(root, directory, state_path, state, base, proposed,
+                               lambda candidate: _build_plain(candidate, directory, state['operations']),
+                               transfer=transfer, finish=acknowledge,
+                               recovery=vm_recovery(root, transfer, workspace_id))
+        result.update(finish_recovery(state['recovery_artifact'], workspace_id, directory / 'previous', directory / 'incoming'))
+        return result
 
 
 def _legacy_batch_apply(root, workspace_id, request):
@@ -1569,10 +1662,9 @@ def _publish_git_in_place(root, directory, base, proposed):
     if state['phase'] != 'published':
         error('recovery_required', 'Unknown Git publication phase.')
     check_git_snapshot(root, proposed)
-    retain_git_snapshot(root, proposed)
 
 
-def publish_git(root, directory, base, proposed, *, transfer=None):
+def publish_git(root, directory, base, proposed, *, transfer=None, recovery=None):
     state_path = directory / 'journal.json'
     if state_path.exists():
         state = json.loads(state_path.read_text())
@@ -1599,7 +1691,11 @@ def publish_git(root, directory, base, proposed, *, transfer=None):
         _publish_git_in_place(candidate, work, base, proposed)
         shutil.rmtree(work)
 
-    _publish_tree(root, directory, state_path, state, base, proposed, build, transfer=transfer)
+    if state['phase'] == 'acknowledged' and state.get('recovery_artifact'):
+        check_git_snapshot(root, proposed)
+        return state['recovery_artifact']
+    _publish_tree(root, directory, state_path, state, base, proposed, build, transfer=transfer, recovery=recovery)
+    return state.get('recovery_artifact')
 
 
 def inspect_push(root, workspace_id, request, *, git):
@@ -1655,7 +1751,14 @@ def rollback_push(root, workspace_id, request, *, git):
         return {'status': 'ABORTED', 'transfer_id': transfer}
     directory = _batch_directory(transfer)
     state_path = directory / 'journal.json'
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
     if status['status'] == 'aborted':
+        artifact_id = state.get('rollback_artifact')
+        if artifact_id:
+            return {'status': 'ABORTED', 'transfer_id': transfer,
+                    **finish_recovery(artifact_id, workspace_id, directory / 'previous', directory / 'incoming',
+                                     directory / 'backup', directory / 'dirslots', directory / 'blobs',
+                                     directory / 'history.bundle')}
         return {'status': 'ABORTED', 'transfer_id': transfer, 'recovery_path': str(directory)}
     if not status['rollback_available']:
         error('recovery_required', 'Rollback requires a verifiable publication before acknowledgment.')
@@ -1675,11 +1778,24 @@ def rollback_push(root, workspace_id, request, *, git):
                 _check_exchange(root, candidate, record, side)
                 _authorize_exchange(root, transfer, record)
                 state['phase'] = 'rolling_back'
+                # Protect the proposed version before exchanging it out of the
+                # live workspace. This is idempotent across interrupted rollback.
+                artifact_id = state.get('rollback_artifact') or ('vm-' + hashlib.sha256(('rollback:' + transfer).encode()).hexdigest())
+                state['rollback_artifact'] = artifact_id
                 _push_write_json(state_path, state)
+                store = artifacts.ArtifactStore()
                 if side == 'replacement':
+                    archive_path = store.root / (artifact_id + '.age')
+                    if not archive_path.exists():
+                        store.admit(artifacts._archive_size(root))
+                    seal_recovery(artifact_id, root, workspace_id, 'vm:' + str(root), record['replacement_digest'])
                     fence.check()
                     _workspace_exchange(candidate, root)
                     fence.check(exchanged=True)
+                elif side == 'original':
+                    # A prior attempt exchanged successfully; complete a missing
+                    # seal from the verified proposal now held in the journal.
+                    seal_recovery(artifact_id, candidate, workspace_id, 'vm:' + str(root), record['replacement_digest'])
                 _batch_sync_dir(root.parent)
                 _batch_sync_dir(directory)
                 if _exchange_side(root, candidate, record) != 'original':
@@ -1691,6 +1807,18 @@ def rollback_push(root, workspace_id, request, *, git):
                 error('recovery_required', 'The original checkpoint could not be verified.')
         state['phase'] = 'aborted'
         _push_write_json(state_path, state)
+        artifact_id = state.get('rollback_artifact')
+        if artifact_id:
+            return {'status': 'ABORTED', 'transfer_id': transfer,
+                    **finish_recovery(artifact_id, workspace_id, directory / 'previous', directory / 'incoming',
+                                     directory / 'backup', directory / 'dirslots', directory / 'blobs',
+                                     directory / 'history.bundle')}
+        for name in ('previous', 'incoming', 'backup', 'dirslots', 'blobs', 'history.bundle'):
+            scratch = directory / name
+            if scratch.is_dir() and not scratch.is_symlink():
+                shutil.rmtree(scratch, ignore_errors=True)
+            else:
+                scratch.unlink(missing_ok=True)
         return {'status': 'ABORTED', 'transfer_id': transfer, 'recovery_path': str(directory)}
 
 
@@ -1727,7 +1855,8 @@ def git_handoff_remote(root, workspace_id, action, request):
                 export.mkdir(mode=0o700, exist_ok=True)
                 _push_write_json(export / 'manifest.json', proposed)
                 checkpoint(root, workspace_id, dict(identity, action='prepare', checkpoint=proposed))
-                publish_git(root, directory, receiving, proposed, transfer=transfer)
+                publish_git(root, directory, receiving, proposed, transfer=transfer,
+                            recovery=vm_recovery(root, transfer, workspace_id))
                 return {'status': 'PUBLISHED', 'recovery_path': str(directory)}
         if not pushing:
             _push_assert_idle(root)
@@ -1755,6 +1884,15 @@ def git_handoff_remote(root, workspace_id, action, request):
                     checkpoint(root, workspace_id, dict(identity, action='commit', transfer_id=transfer))
         else:
             check_git_snapshot(root, proposed)
+        if pushing:
+            journal = directory / 'journal.json'
+            state = json.loads(journal.read_text())
+            if state.get('recovery_artifact'):
+                state['phase'] = 'acknowledged'
+                _push_write_json(journal, state)
+                retained = finish_recovery(state['recovery_artifact'], workspace_id, directory / 'previous',
+                                           directory / 'incoming', directory / 'blobs', directory / 'history.bundle')
+                return {'status': 'SUCCESS', 'checkpoint': proposed, **retained}
         return {'status': 'SUCCESS', 'checkpoint': proposed, 'recovery_path': str(directory) if pushing else None}
 
 
@@ -1765,7 +1903,7 @@ def _guarded(function):
     return guarded
 
 
-for _name in ('capture', 'push_one', 'batch_begin', 'batch_apply', 'git_handoff_remote', 'export_manifest'):
+for _name in ('capture', 'push_one', 'batch_begin', 'batch_apply', 'git_handoff_remote'):
     globals()[_name] = _guarded(globals()[_name])
 
 _original_checkpoint = checkpoint
@@ -1833,6 +1971,14 @@ def replay_handoff(root, workspace_id, action, request, spec, state):
         return {'directory': str(directory), 'upload': False}
     if action == 'batch_begin':
         return {'phase': 'acknowledged', 'upload_path': str(directory / 'incoming'), 'transfer_id': transfer}
+    recovery_dir = Path.home() / '.relay-v0' / 'pushes' / transfer if action == 'push_one' else directory
+    journal = recovery_dir / 'journal.json'
+    if journal.is_file():
+        artifact_id = json.loads(journal.read_text()).get('recovery_artifact')
+        if artifact_id:
+            path = artifacts.ArtifactStore().root / (artifact_id + '.age')
+            return {'status': 'SUCCESS', 'transfer_id': transfer, 'checkpoint': proposed,
+                    'recovery_artifact': artifact_id, 'recovery_path': str(path)}
     if action == 'push_one':
         directory = Path.home() / '.relay-v0' / 'pushes' / transfer
         return {'status': 'SUCCESS', 'transfer_id': transfer, 'checkpoint': proposed, 'recovery_path': str(directory / 'file')}
@@ -1845,7 +1991,11 @@ def dispatch_handoff(root, workspace_id, action, request):
     with turn_lock(workspace_id, root, spec=spec) as reservation:
         if reservation is not None and reservation[0] != 'ACTIVE':
             return replay_handoff(root, workspace_id, action, request, spec, reservation[0])
+        export = 'export-' + spec.transfer
+        store = artifacts.ArtifactStore()
         try:
+            if action == 'git_prepare_pull' or (action == 'checkpoint' and request['action'] in ('begin_import', 'begin_pull', 'prepare')):
+                store.mark(export, pending=True)
             if action in ('git_rollback', 'batch_rollback'):
                 result = rollback_push(root, workspace_id, request, git=action == 'git_rollback')
             elif action.startswith('git_'):
@@ -1866,7 +2016,11 @@ def dispatch_handoff(root, workspace_id, action, request):
             if reservation == ('ACTIVE', True) and (action in ('git_begin', 'batch_begin') or request.get('action') in ('begin_import', 'begin_pull')):
                 with guard_database(write=True) as connection:
                     connection.execute('DELETE FROM handoff_guards WHERE transfer_id=?', (spec.transfer,))
+                if spec.kind in ('import', 'plain_pull', 'git_pull'):
+                    store.mark(export, pending=False)
             raise
+        if spec.terminal_state and spec.kind in ('import', 'plain_pull', 'git_pull', 'pull_abort'):
+            store.mark(export, pending=False)
         if reservation is not None and spec.terminal_state is not None:
             with guard_database(write=True) as connection:
                 connection.execute("UPDATE handoff_guards SET state=? WHERE transfer_id=? AND state='ACTIVE'", (spec.terminal_state, spec.transfer))
@@ -1909,6 +2063,20 @@ def main():
                 if disposition != 'transfer': affected[item['path']] = disposition
             affected.update({path: 'exclude' for path in exclusions})
             result = {'schema_version': 1, 'workspace_id': workspace_id, 'source_path': str(root), 'name': root.name, 'git': git, 'entries': entries, 'policy_rules': rules, 'policy_dispositions': affected, 'estimated_files': sum(x['type'] == 'file' for x in entries), 'estimated_bytes': sum(x.get('size', 0) for x in entries), 'exclusions': exclusions, 'excluded_entries': len(exclusions), 'blockers': [], 'limitations': ['Live-tree estimates; pause independent writers during capture.', 'Symlinks, nested repositories and Git attributes are not supported.', 'Git-ignored files, secrets, keys and database files are included; stop database writers or provide a consistent backup.']}
+        elif action == 'artifact_list':
+            result = {'artifacts': artifacts.ArtifactStore().list(workspace_id)}
+        elif action == 'artifact_cleanup':
+            result = artifacts.ArtifactStore().cleanup(workspace_id)
+        elif action == 'artifact_stream':
+            artifact_id = json.load(sys.stdin)['artifact_id']
+            if not isinstance(artifact_id, str) or not artifact_id.startswith('vm-'):
+                error('invalid_request', 'Only VM recovery copies can be restored.')
+            try:
+                artifacts.ArtifactStore().stream(artifact_id, workspace_id, sys.stdout.fileno())
+            except (OSError, RuntimeError, ValueError) as exc:
+                print(str(exc), file=sys.stderr)
+                sys.exit(1)
+            return
         elif action == 'policy':
             result = {'digest': read_policy(root)[0]}
         elif action == 'git_capture':
@@ -1921,12 +2089,14 @@ def main():
                     current = checkpoint(root, workspace_id, {'action': 'get', 'endpoint': against['endpoint']})
                     if current != {'checkpoint': against, 'pending': None}:
                         error('checkpoint_mismatch', 'The requested delta baseline differs.')
-                manifest, path = capture(root, workspace_id, include_history=request['include_history'], against=against)
-            result = {'manifest': manifest, 'export_path': path}
+                manifest, path = capture(root, workspace_id, include_history=request['include_history'], against=against,
+                                         recipient=request.get('recipient'))
+            result = export_manifest(root, workspace_id, {'transfer_id': manifest['transfer_id']})
         elif action == 'capture':
             with turn_lock(workspace_id, root):
-                manifest, path = capture(root, workspace_id)
-            result = {'manifest': manifest, 'export_path': path}
+                request = json.loads(sys.stdin.read() or '{}')
+                manifest, path = capture(root, workspace_id, recipient=request.get('recipient'))
+            result = export_manifest(root, workspace_id, {'transfer_id': manifest['transfer_id']})
         else: error('invalid_request', 'Unknown operation.')
         print(json.dumps(result, ensure_ascii=True))
     except Exception as exc:

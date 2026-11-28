@@ -158,7 +158,7 @@ def finish(op, pending, pairfile, as_json):
     if git != proposed['git'] or entries != proposed['entries']: raise ValueError('RECOVERY_REQUIRED: local workspace changed during push.')
     next_pair = dict(pair, acknowledgment='acknowledged', generation=proposed['generation'], parent_id=pair['checkpoint_id'], checkpoint_id=transfer, entries=proposed['entries'], git=proposed['git'], remote_recovery_path=result['recovery_path'])
     imp.write_json_atomic(pairfile, next_pair)
-    receipt = {'status':'SUCCESS', 'transfer_id':transfer, 'files':len(changed), 'destination':str(dest), 'vm':op['vm'], 'remote_recovery_path':result['recovery_path']}
+    receipt = {'status':'SUCCESS', 'transfer_id':transfer, 'files':len(changed), 'destination':str(dest), 'vm':op['vm'], 'remote_recovery_path':result['recovery_path'], 'recovery_artifact':result.get('recovery_artifact')}
     imp.write_json_atomic(pairfile.with_suffix('.push-last.json'), receipt)
     pending.unlink()
     # Staging only contains an additional verified copy; the VM recovery artifacts remain.

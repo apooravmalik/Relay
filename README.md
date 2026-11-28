@@ -113,8 +113,8 @@ repository on both endpoints for repeat handoffs.
 
 Plain batch pushes and Git handoffs stage a full replacement on the same
 filesystem and exchange it with the original as one directory operation.
-The previous tree is kept under `previous/` in the reported recovery directory.
-The destination needs space for both trees and a filesystem that supports atomic
+Relay stores the acknowledged recovery copy as an authenticated age-encrypted archive under `~/.relay-v0/artifacts`; the reported `recovery_artifact` ID identifies that copy. Pending transactions keep private staging data until they are acknowledged or safely rolled back.
+The destination needs space for both trees, the encrypted recovery archive, and a filesystem that supports atomic
 directory exchange. Pause independent editors and services on both copies from
 before capture until acknowledgment. The Linux VM helper also verifies writer
 quiescence while capturing and during the swap and checkpoint acknowledgment.
@@ -129,6 +129,31 @@ to see the publication state, with `--resume` to finish, or with `--rollback`
 to restore the verified original before acknowledgment. Rollback retains the
 proposed tree if publication occurred. Reviewed merges still use their own
 resume command.
+
+### Recovery artifact storage
+
+Install the `age` and `age-keygen` commands on both the desktop and VM before
+using workspace handoffs. Relay creates a private age identity on first use and
+keeps encrypted recovery archives for 14 days, subject to an 8 GiB per-endpoint
+quota and a 16 MiB free-space reserve. The newest completed recovery copy for
+each workspace and any pending handoff are retained. If the quota or free-space
+check fails, Relay refuses publication before exchanging the live workspace.
+
+Inspect, clean expired copies, or restore one to a new destination:
+
+```bash
+./relay artifacts list
+./relay artifacts cleanup
+./relay artifacts restore --artifact pc-TRANSFER_ID --into /absolute/path/to/recovery
+./relay artifacts list --vm relay-do-v0 --workspace WORKSPACE_ID
+./relay artifacts restore --vm relay-do-v0 --workspace WORKSPACE_ID \
+  --artifact vm-TRANSFER_ID --into /absolute/path/to/recovery
+```
+
+Keep a secure backup of `~/.relay-v0/artifact-identity.agekey` on each
+endpoint. Without that identity, its archives cannot be decrypted. Do not copy
+the identity into the workspace or commit it to Git. Cleanup does not remove
+pending transactions or the newest recovery artifact for an endpoint.
 
 A root `.relayignore` uses `protect PATTERN` and `exclude PATTERN`. Blank lines
 and lines starting with `#` are allowed. Patterns without a slash match any

@@ -264,12 +264,8 @@ def finish(op, pending, importer, as_json):
     else:
         ssh, host = importer.ssh_command(op['vm'])
         remote_cp(importer, op['vm'], base, 'begin_pull', cp(base, manifest))
-        payload = staging / 'payload'; payload.mkdir(exist_ok=True)
-        import shlex, subprocess
-        source = host + ':' + shlex.quote(op['export_path'].rstrip('/') + '/')
-        result = subprocess.run(['rsync', '-r', '--checksum', '--partial', '-e', ' '.join(shlex.quote(x) for x in ssh), '--', source, str(payload) + '/'])
-        if result.returncode: raise ValueError('FAILED_RECOVERABLE: download interrupted; use --resume-update with destination.')
-        if json.loads((payload / 'manifest.json').read_text()) != manifest: raise ValueError('Transfer manifest changed.')
+        payload = importer.download_export(ssh, host, op, staging,
+                                          'FAILED_RECOVERABLE: download interrupted; use --resume-update with destination.')
         importer.verify_payload(payload, manifest)
         if candidate.exists(): shutil.rmtree(candidate)
         importer.reconstruct(payload, candidate, manifest)
@@ -289,6 +285,11 @@ def finish(op, pending, importer, as_json):
         if latest['source_path'] != base['source_path'] or latest['entries'] != manifest['entries'] or latest['git'] != manifest['git']:
             raise ValueError('BUSY: source changed after capture; no destination files changed.')
         verify_with_preserved(dest, {'entries': base['entries'], 'git': base['git']}, excluded_paths, excluded_fingerprint, importer)
+        artifact_id, workspace, group = export_workspace.pc_recovery(dest, manifest['transfer_id'])
+        witness = export_workspace._tree_fingerprint(dest)
+        op['recovery_artifact'] = export_workspace.seal_recovery(artifact_id, dest, workspace, group, witness)
+        if export_workspace._tree_fingerprint(dest) != witness:
+            raise ValueError('BUSY: local files changed while archiving the previous workspace.')
         remote_cp(importer, op['vm'], base, 'prepare', cp(base, manifest))
         op['phase'] = 'publishing'; importer.write_json_atomic(pending, op)
         swap(candidate, dest)
@@ -313,14 +314,35 @@ def finish(op, pending, importer, as_json):
     remote_state = remote_cp(importer, op['vm'], base, 'commit', transfer_id=manifest['transfer_id'])
     if remote_state['checkpoint'] != cp(base, manifest) or remote_state['pending'] is not None:
         raise ValueError('RECOVERY_REQUIRED: remote acknowledgment does not match.')
-    new = dict(base, acknowledgment='acknowledged', generation=base.get('generation', 0) + 1, parent_id=base['checkpoint_id'], checkpoint_id=manifest['transfer_id'],
-               entries=manifest['entries'], git=manifest['git'], exclusions=manifest['exclusions'], recovery_path=str(candidate))
+    artifact_id = op.get('recovery_artifact')
+    if not artifact_id:
+        artifact_id, workspace, group = export_workspace.pc_recovery(dest, manifest['transfer_id'])
+        op['recovery_artifact'] = export_workspace.seal_recovery(
+            artifact_id, candidate, workspace, group, export_workspace._tree_fingerprint(candidate))
+        importer.write_json_atomic(pending, op)
+    new = dict(base, acknowledgment='acknowledged', generation=base.get('generation', 0) + 1,
+               parent_id=base['checkpoint_id'], checkpoint_id=manifest['transfer_id'],
+               entries=manifest['entries'], git=manifest['git'], exclusions=manifest['exclusions'])
     importer.write_json_atomic(Path(op['pairing']), new)
-    op['phase'] = 'acknowledged'; importer.write_json_atomic(pending, op)
-    receipt = {'status':'SUCCESS', 'checkpoint_id':new['checkpoint_id'], 'parent_id':new['parent_id'], 'recovery_path':str(candidate), 'destination':str(dest), 'vm':op['vm']}
+    op['phase'] = 'acknowledged'
+    importer.write_json_atomic(pending, op)
+    return finish_acknowledged(op, pending, importer, new, as_json)
+
+
+def finish_acknowledged(op, pending, importer, pair, as_json):
+    staging = Path(op['staging'])
+    candidate = staging / 'project'
+    retained = {'recovery_path': str(candidate)}
+    if op.get('recovery_artifact'):
+        retained = export_workspace.finish_recovery(op['recovery_artifact'], None, candidate)
+    receipt = {'status': 'SUCCESS', 'checkpoint_id': pair['checkpoint_id'], 'parent_id': pair['parent_id'],
+               'destination': op['destination'], 'vm': op['vm'], **retained}
     importer.write_json_atomic(Path(op['pairing']).with_suffix('.pull-last.json'), receipt)
     pending.unlink()
-    shutil.rmtree(staging / 'payload', ignore_errors=True)
+    if op.get('recovery_artifact'):
+        shutil.rmtree(staging, ignore_errors=True)
+    else:
+        shutil.rmtree(staging / 'payload', ignore_errors=True)
     print(json.dumps(receipt, ensure_ascii=True, indent=None if as_json else 2))
     return 0
 
@@ -353,9 +375,10 @@ def resume(args, importer):
             remote = remote_cp(importer, op['vm'], op['base'], 'get')
             if pair['checkpoint_id'] != op['manifest']['transfer_id'] or remote['checkpoint'] != cp(op['base'], op['manifest']) or remote['pending'] is not None:
                 raise ValueError('RECOVERY_REQUIRED: acknowledged state does not match both endpoints.')
-            receipt = {'status':'SUCCESS', 'checkpoint_id':pair['checkpoint_id'], 'parent_id':pair['parent_id'], 'recovery_path':str(Path(op['staging']) / 'project'), 'destination':str(dest), 'vm':op['vm']}
-            importer.write_json_atomic(pairfile.with_suffix('.pull-last.json'), receipt)
-            path.unlink(); print(json.dumps(receipt)); return 0
+            staging = Path(op['staging'])
+            if staging.parent != dest.parent or not staging.name.startswith('.relay-update-') or staging.is_symlink():
+                raise ValueError('RECOVERY_REQUIRED: invalid staging directory.')
+            return finish_acknowledged(op, path, importer, pair, args.json)
         return finish(op, path, importer, args.json)
 
 
