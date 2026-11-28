@@ -30,8 +30,16 @@ def content(item, layer, store):
         return None
     key = 'blob-' + item['oid'] if layer == 'index' else 'file-' + item['sha256']
     result = store / key
-    if not result.is_file() or result.is_symlink():
-        raise ValueError('Baseline content is unavailable. Import a fresh pairing if recovery copies cannot be verified.')
+    if not result.exists():
+        try:
+            engine.load_content(key, result)
+        except ValueError as exc:
+            legacy = Path.home() / '.relay-v0' / 'git-content' / key
+            if not str(exc).startswith('artifact_missing:') or not legacy.is_file() or legacy.is_symlink():
+                raise ValueError('Baseline content is unavailable. Import a fresh pairing if recovery copies cannot be verified.') from exc
+            engine.store_content(key, legacy)
+            engine.load_content(key, result)
+            legacy.unlink()
     if layer != 'index' and engine.sha(result) != item['sha256']:
         raise ValueError('Retained workspace content checksum differs.')
     return result
@@ -87,10 +95,8 @@ def write_version(project, path, layer, base_item, source, store):
                 valid = engine.sha(Path(temp.name)) == digest
             if not valid:
                 raise ValueError('Reviewed file changed while being captured.')
-            try:
-                os.link(temp.name, target)
-            except FileExistsError:
-                pass
+            engine.store_content(target.name, Path(temp.name))
+            os.link(temp.name, target)
     return item
 
 
@@ -324,9 +330,10 @@ def create_plan(args, pair, project, folder):
     if len({s['git'].get('policy_digest') for s in (local, cloud, base)}) != 1:
         raise ValueError('POLICY_MISMATCH: match both endpoints to the checkpoint before creating a merge plan.')
     directory = Path(tempfile.mkdtemp(prefix='.relay-merge-', dir=project.parent))
-    payload = directory / 'vm-original'
-    payload.mkdir(mode=0o700)
-    handoff.rsync(ssh, host + ':' + shlex.quote(captured['export_path'] + '/'), str(payload) + '/')
+    payload = imp.download_export(ssh, host, captured, directory, 'Merge export download failed.')
+    original = directory / 'vm-original'
+    os.rename(payload, original)
+    payload = original
     if json.loads((payload / 'manifest.json').read_text()) != cloud:
         raise ValueError('Captured VM manifest differs.')
     imp.verify_payload(payload, cloud)
@@ -486,13 +493,28 @@ def publish(args, state, statefile, pending, project, pairfile):
             os.link(directory / 'history.bundle', upload / 'history.bundle')
         handoff.rsync(ssh, str(upload) + '/', host + ':' + shlex.quote(status['directory'] + '/'))
     remote('git_apply')
-    engine.publish_git(project, local, state['local'], proposed)
+    artifact_id = engine.publish_git(project, local, state['local'], proposed,
+                                     recovery=engine.pc_recovery(project, proposed['transfer_id']))
+    engine.retain_git_snapshot(project, proposed)
     ack = remote('git_ack_push')
     if ack['checkpoint'] != proposed:
         raise ValueError('Merge checkpoint acknowledgment differs.')
-    return handoff.complete({'base': pair, 'prior': base, 'proposed': proposed, 'direction': 'merge',
-                             'destination': str(project), 'vm': args.vm, 'pairing': str(pairfile)},
-                            pending, imp, str(directory), args.json)
+    retained = {'recovery_path': str(directory)}
+    if artifact_id:
+        journal = local / 'journal.json'
+        publication = json.loads(journal.read_text())
+        publication['phase'] = 'acknowledged'
+        imp.write_json_atomic(journal, publication)
+        retained = engine.finish_recovery(artifact_id, None, local / 'previous')
+    retained.update({('remote_' + key): ack[key] for key in ('recovery_path', 'recovery_artifact') if key in ack})
+    result = handoff.complete({'base': pair, 'prior': base, 'proposed': proposed, 'direction': 'merge',
+                               'destination': str(project), 'vm': args.vm, 'pairing': str(pairfile)},
+                              pending, imp, retained, args.json)
+    state['phase'] = 'acknowledged'
+    imp.write_json_atomic(statefile, state)
+    if artifact_id:
+        shutil.rmtree(directory, ignore_errors=True)
+    return result
 
 
 def main():

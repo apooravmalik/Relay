@@ -45,8 +45,7 @@ def verify_legacy(importer, pair, ssh, host):
                 any(item['path'] == '.relayignore' for item in manifest['entries'])):
             raise ValueError('Baseline differs.')
         with tempfile.TemporaryDirectory(prefix='relay-legacy-') as temporary:
-            payload = Path(temporary)
-            rsync(ssh, host + ':' + shlex.quote(saved['export_path'].rstrip('/') + '/'), str(payload) + '/')
+            payload = importer.download_export(ssh, host, saved, Path(temporary), 'Legacy export download failed.')
             if importer.digest(payload / 'manifest.json') != saved['sha256']:
                 raise ValueError('Retained manifest differs.')
             importer.verify_payload(payload, manifest)
@@ -231,19 +230,17 @@ def _finish(op, pending, importer, as_json):
         engine.check_git_snapshot(dest, proposed)
         engine.retain_git_snapshot(dest, proposed)
         ack = remote('git_ack_push')
-        recovery = result['recovery_path']
+        retained = {key: ack[key] for key in ('recovery_artifact', 'recovery_path') if key in ack}
+        retained.setdefault('recovery_path', result['recovery_path'])
     else:
         recovery = str(stage / 'publication')
         publication = Path(recovery)
         if not (publication / 'journal.json').exists():
             engine.check_git_snapshot(dest, base)
-            payload = stage / 'payload'
-            payload.mkdir(mode=0o700, exist_ok=True)
             remote('git_prepare_pull')
-            rsync(ssh, host + ':' + shlex.quote(op['export_path'].rstrip('/') + '/'), str(payload) + '/')
+            payload = importer.download_export(ssh, host, op, stage,
+                                              'FAILED_RECOVERABLE: download interrupted; resume the Git pull.')
             manifest = op['manifest']
-            if json.loads((payload / 'manifest.json').read_text()) != manifest:
-                raise ValueError('Transfer manifest changed.')
             importer.verify_payload(payload, manifest, base)
             publication.mkdir(mode=0o700, exist_ok=True)
             stage_files(payload / 'files', publication, op['ops'], captured=True)
@@ -256,16 +253,28 @@ def _finish(op, pending, importer, as_json):
                     else:
                         os.link(source, target)
         remote('git_prepare_pull')
-        engine.publish_git(dest, publication, base, proposed)
+        artifact_id = engine.publish_git(dest, publication, base, proposed,
+                                         recovery=engine.pc_recovery(dest, proposed['transfer_id']))
+        engine.retain_git_snapshot(dest, proposed)
         ack = remote('git_ack_pull')
+        retained = {'recovery_path': recovery}
+        if artifact_id and ack['checkpoint'] == proposed:
+            journal = publication / 'journal.json'
+            state = json.loads(journal.read_text())
+            state['phase'] = 'acknowledged'
+            importer.write_json_atomic(journal, state)
+            retained = engine.finish_recovery(artifact_id, None, publication / 'previous')
 
     if ack['checkpoint'] != proposed:
         raise ValueError('RECOVERY_REQUIRED: VM acknowledgment differs.')
     engine.check_git_snapshot(dest, proposed)
-    return complete(op, pending, importer, recovery, as_json)
+    result = complete(op, pending, importer, retained, as_json)
+    if retained.get('recovery_artifact'):
+        shutil.rmtree(stage, ignore_errors=True)
+    return result
 
 
-def complete(op, pending, importer, recovery, as_json):
+def complete(op, pending, importer, retained, as_json):
     pair, base, proposed = op['base'], op['prior'], op['proposed']
     dest = Path(op['destination'])
     pairfile = Path(op['pairing'])
@@ -275,9 +284,9 @@ def complete(op, pending, importer, recovery, as_json):
     importer.write_json_atomic(pairfile, new)
     receipt = {'status': 'SUCCESS', 'checkpoint_id': new['checkpoint_id'], 'transfer_id': new['checkpoint_id'],
                'parent_id': new['parent_id'], 'generation': new['generation'], 'head': new['git']['head'],
-               'vm': op['vm'], 'destination': str(dest), 'recovery_path': recovery}
+               'vm': op['vm'], 'destination': str(dest), **retained}
     if op['direction'] == 'push':
-        receipt['remote_recovery_path'] = recovery
+        receipt['remote_recovery_path'] = retained['recovery_path']
     importer.write_json_atomic(pairfile.with_suffix('.' + op['direction'] + '-last.json'), receipt)
     pending.unlink()
     return print_result(receipt, as_json)

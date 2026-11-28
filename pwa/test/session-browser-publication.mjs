@@ -23,7 +23,7 @@ const exec = promisify(execFile);
 const hash = (value) => createHash('sha256').update(value).digest('hex');
 const quote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
 const side = (file) => path.join(directory, file);
-const workspaces = ['before', 'after', 'rollback', 'git-after', 'writer'].map((name) => {
+const workspaces = ['before', 'after', 'rollback', 'git-after', 'writer', 'quota'].map((name) => {
   const root = side(name);
   return { id: hash(root).slice(0, 16), name, path: root, status: 'ready', gitAvailable: name === 'git-after', branch: name === 'git-after' ? 'main' : null };
 });
@@ -130,6 +130,7 @@ try {
     await writeFile(path.join(workspace.path, 'one.txt'), 'old one');
     await writeFile(path.join(workspace.path, 'two.txt'), 'old two');
     await writeFile(path.join(workspace.path, 'delete.txt'), 'old deleted file');
+    await writeFile(path.join(workspace.path, '.env'), 'TOKEN=synthetic-rly018-secret');
     await writeFile(path.join(workspace.path, 'node_modules', 'runtime.txt'), 'VM-only runtime');
     if (workspace.gitAvailable) {
       await git(workspace.path, 'init', '-qb', 'main');
@@ -167,6 +168,14 @@ try {
     }
     const writer = workspace.name === 'writer';
     const after = workspace.name !== 'before';
+    if (workspace.name === 'quota') {
+      const unchanged = await signature(workspace.path);
+      const refused = await run(args, { RELAY_ARTIFACT_LIMIT_BYTES: '1' }, 1);
+      assert.match(refused.message, /artifact_quota/);
+      assert.deepEqual(await signature(workspace.path), unchanged);
+      await run([...args, '--rollback']);
+      assert.deepEqual(await signature(workspace.path), unchanged);
+    }
     const interrupted = await run(push, { RELAY_ATOMIC_CRASH: writer ? 'writer' : after ? 'after' : 'before' }, 1);
     if (writer) {
       assert.match(interrupted.message, /writer_conflict/);
@@ -231,16 +240,25 @@ try {
       const rollback = await run([...args, '--rollback']);
       assert.equal(rollback.status, 'ABORTED');
       assert.deepEqual(await signature(workspace.path), original);
-      assert.equal(await readFile(path.join(retained, 'two.txt'), 'utf8'), 'new two');
-      await assert.rejects(access(path.join(retained, 'delete.txt')), { code: 'ENOENT' });
+      const proposal = side('restored-rollback-proposal');
+      await run(['artifacts', 'restore', '--vm', 'relay-v0', '--workspace', workspace.id,
+        '--artifact', rollback.recovery_artifact, '--into', proposal]);
+      assert.equal(await readFile(path.join(proposal, 'two.txt'), 'utf8'), 'new two');
+      await assert.rejects(access(path.join(proposal, 'delete.txt')), { code: 'ENOENT' });
       assert.deepEqual(await checkpoint(workspace, endpoint), { checkpoint: beforeAck.checkpoint, pending: null });
       await readInBrowser('one.txt', 'old one');
       await readInBrowser('two.txt', 'old two');
     } else {
       const receipt = await run([...args, '--resume']);
       assert.equal(receipt.transfer_id, observed.transfer_id);
-      assert.equal(receipt.remote_recovery_path, path.dirname(retained));
-      assert.deepEqual(await signature(retained), original);
+      assert.equal(path.extname(receipt.remote_recovery_path), '.age');
+      const encrypted = await readFile(receipt.remote_recovery_path);
+      assert.equal(encrypted.includes(Buffer.from('synthetic-rly018-secret')), false);
+      const restored = side('restored-' + workspace.name);
+      await run(['artifacts', 'restore', '--vm', 'relay-v0', '--workspace', workspace.id,
+        '--artifact', receipt.recovery_artifact, '--into', restored]);
+      assert.deepEqual(await signature(restored), original);
+      await assert.rejects(access(path.join(side('.relay-v0/batch-pushes/' + receipt.transfer_id), 'previous')), { code: 'ENOENT' });
       await readInBrowser('one.txt', 'new one');
       await readInBrowser('two.txt', 'new two');
       const acknowledged = await checkpoint(workspace, endpoint);
@@ -250,7 +268,7 @@ try {
       await run([...args, '--resume']);
       assert.deepEqual(await checkpoint(workspace, endpoint), acknowledged);
       await writeFile(path.join(workspace.path, 'one.txt'), 'live edit after acknowledgment');
-      assert.deepEqual(await signature(retained), original);
+      assert.deepEqual(await signature(restored), original);
     }
 
     await page.locator('#chats-tab').click();
